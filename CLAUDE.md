@@ -55,12 +55,10 @@ make
 
 ### Web Interface
 
-The `htdocs/` directory contains a comprehensive AI demo web interface:
-- Multiple AI features: facial recognition, object detection, motion detection, hand gesture recognition
-- Video streaming with real-time AI processing
-- Audio event detection and ChatGPT integration
-- Bootstrap-based responsive UI with FontAwesome icons
-- Modular JavaScript architecture with specialized player creators
+The `htdocs/` directory now contains a minimal browser viewer only:
+- `main.html` is the single entry page
+- JavaScript is trimmed to websocket connect, ChaCha20 decrypt, H.264 decode/display, and PCM audio playback
+- Extra demo pages and UI assets have been removed
 
 ### Cross-Platform Build System
 

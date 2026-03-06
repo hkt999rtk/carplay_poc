@@ -100,4 +100,4 @@
 
 ## Scope Notes
 - `video2` is intentionally out of scope for v1.
-- AI/JSON relay from `gateway` to `gateway_client` is intentionally out of scope for v1.
+- JSON relay from `gateway` to `gateway_client` is intentionally out of scope for v1.

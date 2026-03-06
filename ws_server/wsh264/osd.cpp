@@ -157,29 +157,3 @@ void RemoteOSD::globalAlpha(int alpha)
     addValue("v", alpha);
     endCmd();
 }
-
-const char *test_object_detection_osd()
-{
-    static string s = "{\"type\": \"object_detection\",\"result\": {\"status\":\"ok\",\"elapsed_time\":1817,\"model\":\"yolov4-416-fp32-3\",\"width\":1920,\"height\":1080,\"score\":60,\"iou\":60,\"detection\":[{\"minx\":401,\"maxx\":546,\"miny\":302,\"maxy\":433,\"score\":99,\"id\":2,\"class\":\"car\"}]}}";
-    return s.c_str();
-}
-
-const char *test_osd()
-{
-    RemoteOSD osd;
-
-    osd.beginPath();
-    osd.strokeStyle("red");
-    osd.lineWidth(6);
-    osd.rect(100, 100, 300, 300);
-    osd.stroke();
-    osd.fillStyle("blue");
-    osd.fillRect(150, 150, 250, 200);
-    osd.fillStyle("green");
-    osd.font(60, "Arial");
-    osd.fillText("HELLO, OSD", 50, 50);
-
-    // output string
-    static string s = osd.getJson();
-    return s.c_str();
-}

@@ -315,45 +315,7 @@ void deploy(const char *filename, const char *c_name)
 }
 #endif
 
-#define VER_NAME    "web_ver.html"
-void read_version(int *major, int *minor)
-{
-    char buf[256];
-
-    *major = 0;
-    *minor = 0;
-    snprintf(buf, 256, "%s/%s", SOURCE_PATH, VER_NAME);
-    FILE *infile = fopen(buf, "rt");
-
-    if (infile != NULL) {
-        if (fscanf(infile, "%d.%d", major, minor) == 2) {
-            // success, do nothing
-        }
-        fclose(infile);
-    }
-}
-
-void write_version()
-{
-    char filename[256];
-    int major, minor;
-
-    read_version(&major, &minor);
-    snprintf(filename, 256, "%s/%s", SOURCE_PATH, VER_NAME);
-    FILE *outfile = fopen(filename, "wt");
-    if (outfile == NULL) {
-        printf("error: cannot create version.html\n");
-        exit(1);
-    }
-
-    minor++;
-    fprintf(outfile, "%d.%d", major, minor);
-
-    fclose(outfile);
-}
-
 int main(int argc, char **argv)
 {
-    write_version();
     printdir((char *)SOURCE_PATH);
 }

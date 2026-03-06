@@ -67,7 +67,8 @@ cd build
 http://127.0.0.1:9090/main.html
 ```
 
-browser 會直接連到 `ws://127.0.0.1:8081`，先收 `crypto_init`，再由 JavaScript 解密 binary media packet 並顯示。
+`main.html` 是精簡過的 viewer，只保留 websocket 連線、ChaCha20 解密、H.264 顯示與 PCM audio 播放。
+browser 會直接連到 `ws://127.0.0.1:8081`，先收 `crypto_init`，再由 JavaScript 解密 binary media packet 並播放。
 
 ## 跑 relay pipeline
 
@@ -118,7 +119,7 @@ ctest --output-on-failure
 
 ## 專案重點路徑
 
-- `htdocs/`, `htdocs_full/`: browser UI 與 JS player
+- `htdocs/`: 最小 browser viewer (`main.html` + websocket/decode/display 所需 JS/wasm)
 - `ws_server/wsh264/`: websocket server 與 upstream media source
 - `ws_server/gateway/`: relay binary
 - `ws_server/gateway_client/`: host playback client

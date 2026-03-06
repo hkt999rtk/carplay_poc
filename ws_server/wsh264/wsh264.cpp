@@ -291,29 +291,6 @@ static void read_json(const char *filename, myvector<TrackObject> &vec)
 }
 #endif
 
-static myvector<mystring> json_vec;
-static int json_idx = 0;
-static void read_json(const char *filename, myvector<mystring> &vec)
-{
-	FILE *infile = fopen(filename, "rt");
-	if (infile==NULL) {
-		printf("cannot open file [%s]\n", filename);
-		exit(0);
-	}
-	while (!feof(infile)) {
-		char msg[4096];
-		memset(msg, 0, sizeof(msg));
-		fgets(msg, sizeof(msg), infile);
-		if (strlen(msg) > 10) {
-			msg[strlen(msg)-1] = 0;
-			mystring m(msg);
-			vec.push_back(m);
-		}
-	}
-	fclose(infile);
-	printf("json: %d lines\n", vec.size());
-}
-
 void *audio_streaming(void *data) // 16k, 16bits, mono
 {
 	(void)data;
@@ -332,30 +309,6 @@ void *audio_streaming(void *data) // 16k, 16bits, mono
 		send_encrypted_media(app, CRYPTO_STREAM_ID_AUDIO, &start[cursor], slice);
 		cursor += slice;
 		usleep(20000); // 10ms
-
-		static int counter = 0;
-		if (counter == 0) {
-			static int round = 0;
-			const char *t;
-			round = (round + 1)%4;
-			// audio events
-			switch (round) {
-				case 0:
-					t = "{ \"type\":\"audio_detection\", \"result\": {\r\n  \"status\":\"ok\",\r\n  \"elapsed_time\":1817,\r\n  \"model\":\"yolov4-416-fp32-3\",\r\n  \"detection\": [ {\"class\":\"Speech\"}]\r\n  }\r\n}";
-					break;
-				case 2:
-					t = "{ \"type\":\"audio_detection\", \"result\": {\r\n  \"status\":\"ok\",\r\n  \"elapsed_time\":1817,\r\n  \"model\":\"yolov4-416-fp32-3\",\r\n  \"detection\": [ {\"class\":\"Knock\"}]\r\n  }\r\n}";
-					break;
-				case 1:
-					t = "{ \"type\":\"audio_detection\", \"result\": {\r\n  \"status\":\"ok\",\r\n  \"elapsed_time\":1817,\r\n  \"model\":\"yolov4-416-fp32-3\",\r\n  \"detection\": [ {\"class\":\"Music\"}]\r\n  }\r\n}";
-					break;
-				default:
-					t = "{ \"type\":\"audio_detection\", \"result\": {\r\n  \"status\":\"ok\",\r\n  \"elapsed_time\":1817,\r\n  \"model\":\"yolov4-416-fp32-3\",\r\n  \"detection\": [ ]\r\n  }\r\n}";
-					break;
-			}
-			ws_sendframe(app->conn, (const char *)t, strlen(t), WS_FR_OP_TXT);
-		}
-		counter = (counter + 1)%250;
 	}
 	app->state &= (~STATE_STREAMING_AUDIO);
 	app->state &= (~STATE_CLOSING_AUDIO);
@@ -391,61 +344,10 @@ void *h264_streaming(void* data)
 
 		send_encrypted_media(app, CRYPTO_STREAM_ID_VIDEO, chunk.start, chunk.size);
 
-		// video events
-		/*
-		extern const char *test_osd();
-		const char *osd_command = test_osd();
-		ws_sendframe(app->conn, (const char *)osd_command, strlen(osd_command), WS_FR_OP_TXT);
-		*/
-
-		/*
-		extern const char *test_object_detection_osd();
-		const char *osd_command = test_object_detection_osd();
-		ws_sendframe(app->conn, (const char *)osd_command, strlen(osd_command), WS_FR_OP_TXT);
-		*/
-
-		if (json_vec.size() > 0) {
-			const char *osd_command = json_vec[json_idx].c_str();
-			//printf("send\n");
-			//printf("%s\n", osd_command);
-			ws_sendframe(app->conn, (const char *)osd_command, strlen(osd_command), WS_FR_OP_TXT);
-			json_idx++;
-			if (json_idx>=json_vec.size())
-				json_idx = 0;
-		}
-
-		//printf("%s\n", osd_command);
-
 		int nal_type = *chunk.start & 0x1f;
 		if ((nal_type>=1) && (nal_type<=5)) {
 			//printf("nal_type=%d\n", nal_type);
 			usleep(33000); // 30fps
-
-			static int counter = 0;
-			if (++counter>=30) {
-				// send system info for test
-				static int test_number = 0;
-				test_number++;
-				if (test_number>100) {
-					test_number = 0;
-				}
-				char str[256];
-				snprintf(str, sizeof(str), "{\"type\":\"system_info\",\"result\":{\"status\":\"ok\",\"cpu\":%d,\"od\":0,\"fr\":0,\"palm\":0}}", test_number);
-				ws_sendframe(app->conn, str, strlen(str), WS_FR_OP_TXT);
-				counter = 0;
-			}
-
-#if 1
-			static int md_counter = 0;
-			if (++md_counter > 3) {
-				char str[1024];
-
-			strcpy(str, "{\"type\": \"md_result\", \"result\": { \"value\" : [ {\"xmin\" : 0.123, \"ymin\" : 0.456, \"xmax\" : 0.145, \"ymax\" : 0.789}, {\"xmin\" : 0.123, \"ymin\" : 0.456, \"xmax\" : 0.145, \"ymax\" : 0.789}, {\"xmin\" : 0.123, \"ymin\" : 0.456, \"xmax\" : 0.145, \"ymax\" : 0.789} ] } }");
-
-				ws_sendframe(app->conn, str, strlen(str), WS_FR_OP_TXT);
-				md_counter = 0;
-    		}
-#endif
 		}
 	}
 	app->state &= (~STATE_CLOSING_VIDEO);
@@ -528,20 +430,6 @@ static void stop_audio_stream(ws_cli_conn_t *conn, cJSON *obj)
 	}
 }
 
-static void get_model_status(ws_cli_conn_t *conn, cJSON *obj)
-{
-	(void)obj;
-	const char *resp = "{ \"type\": \"get_model_status\", \"result\": { \"value\" : [ {\"yolo4t\" : \"running\", \"fps\" : 6}, {\"retinaface\" : \"stop\", \"fps\" : 0}, {\"mobilenetface\" : \"stop\", \"fps\" : 0}, {\"yamnet\" : \"running\", \"fps\" : 6} ] } }";
-	ws_sendframe(conn, resp, strlen(resp), WS_FR_OP_TXT);
-}
-
-static void get_model_meta(ws_cli_conn_t *conn, cJSON *obj)
-{
-	(void)obj;
-	const char *resp = "{\"type\": \"get_model_meta\", \"result\": { \"value\": [\"class1\", \"class2\", \"class3\", \"class4\"]}}";
-	ws_sendframe(conn, resp, strlen(resp), WS_FR_OP_TXT);
-}
-
 static void start_mp4_record(ws_cli_conn_t *conn, cJSON *obj)
 {
 	printf("start mp4 recording\n");
@@ -564,117 +452,12 @@ static void mp4_record_status(ws_cli_conn_t *conn, cJSON *obj)
 	printf("mp4_record_status\n");
 }
 
-static void start_model(ws_cli_conn_t *conn, cJSON *obj)
-{
-	(void)obj;
-	(void)conn;
-	#if 0
-	cJSON *param = cJSON_GetObjectItem(obj, "param");
-	int n = cJSON_GetArraySize(param);
-	printf("start_model: size = %d\n", n);
-	for (int i=0; i<n; i++) {
-		cJSON* subitem = cJSON_GetArrayItem(param, i);
-		printf("model(%d)=%s\n", i, subitem->valuestring);
-	}
-	#endif
-}
-
-static void stop_model(ws_cli_conn_t *conn, cJSON *obj)
-{
-	(void)obj;
-	(void)conn;
-	#if 0
-	cJSON *param = cJSON_GetObjectItem(obj, "param");
-	int n = cJSON_GetArraySize(param);
-	printf("stop_model: size = %d\n", n);
-	for (int i=0; i<n; i++) {
-		cJSON* subitem = cJSON_GetArrayItem(param, i);
-		printf("model(%d)=%s\n", i, subitem->valuestring);
-	}
-	#endif
-}
-
-static void reg_face(ws_cli_conn_t *conn, cJSON *obj)
-{
-	(void)obj;
-#if 1	
-	FILE *infile = fopen("./rgb_r.bin", "rb");
-	if (infile == NULL) {
-		printf("error: cannot open rgb_r.bin\n");
-		exit(0);
-	}
-	fseek(infile, 0, SEEK_END);
-	size_t size = ftell(infile);
-	fseek(infile, 0, SEEK_SET);
-	unsigned char *b = (unsigned char *)malloc(size);
-	fread(b, 1, size, infile);
-	fclose(infile);
-
-	size_t out_len = 0;
-	unsigned char *ao = base64_encode(b, size, &out_len);
-	unsigned char *out = (unsigned char *)malloc(out_len+1);
-	int c = 0;
-	for (int i=0; i<(int)out_len; i++) {
-		if (ao[i] != 0x0a) {
-			out[c++] = ao[i];
-		}
-	}
-	out[c] = 0;
-	free(b);
-	free(ao);
-
-	// success
-	char *reg_face_resp = (char *)malloc(75537+512);
-	snprintf(reg_face_resp, 75537+512, "{ \"type\": \"reg_face\", \"result\": { \"status\": \"ok\", \"value\" : {\"faceid\" : 123, \"name\" : \"Guest1\", \"thumbnail\" : \"%s\", \"total_face\":3} } }", out);
-	// fail
-	ws_sendframe(conn, reg_face_resp, strlen(reg_face_resp), WS_FR_OP_TXT);
-	free(reg_face_resp);
-	free(out);
-#else
-	const char *reg_face_resp = "{ \"type\": \"reg_face\", \"result\": { \"status\": \"fail\", \"error_code\" : 123 }}";
-	ws_sendframe(conn, reg_face_resp, strlen(reg_face_resp), WS_FR_OP_TXT);
-#endif
-}
-
-static void unreg_face(ws_cli_conn_t *conn, cJSON *obj)
-{
-	/* do nothing */
-	(void)obj;
-	(void)conn;
-}
-
-static void unreg_all_face(ws_cli_conn_t *conn, cJSON *obj)
-{
-	/* do nothing */
-	(void)obj;
-	(void)conn;
-}
-
-static void rename_face(ws_cli_conn_t *conn, cJSON *obj)
-{
-	/* do nothing */
-	(void)obj;
-	(void)conn;
-}
-
-static void get_reg_face(ws_cli_conn_t *conn, cJSON *obj)
-{
-	(void)obj;
-	const char *resp = "{ \"type\": \"get_reg_face\", \"result\": { \"value\" : [ {\"faceid\" : 123, \"name\" : \"Kevin Huang\"}, {\"faceid\" : 456, \"name\" : \"Neo\"}, {\"faceid\" : 789, \"name\" : \"Cathy\"} ] } }";
-	ws_sendframe(conn, resp, strlen(resp), WS_FR_OP_TXT);
-}
-
 static void get_version(ws_cli_conn_t *conn, cJSON *obj)
 {
 	(void)obj;
 	printf("get_version\n");
 	const char *resp = "{\"type\": \"get_version\", \"result\": { \"value\" : [\"1.0.0\"]}}";
 	ws_sendframe(conn, resp, strlen(resp), WS_FR_OP_TXT);
-}
-
-static void setup_tracking(ws_cli_conn_t *conn, cJSON *obj)
-{
-	// do nothing
 }
 
 static void set_smartbitrate(ws_cli_conn_t *conn, cJSON *obj)
@@ -810,23 +593,13 @@ static app_cmd_t app_cmd[] = {
 	{"stop_stream", stop_video_stream},
 	{"start_audio_stream", start_audio_stream},
 	{"stop_audio_stream", stop_audio_stream},
-	{"get_model_status", get_model_status},
-	{"start_model", start_model},
-	{"stop_model", stop_model},
-	{"reg_face", reg_face},
-	{"unreg_face", unreg_face},
-	{"unreg_allface", unreg_all_face},
-	{"get_reg_face", get_reg_face},
-	{"rename_face", rename_face},
 	{"get_version", get_version},
-	{"setup_tracking", setup_tracking},
 	{"set_smartbitrate", set_smartbitrate},
 	{"set_config", set_config},
 	{"get_config", get_config},
 	{"md", motion_detection},
 	{"ircut", ircut_onoff},
 	{"isp_fps", isp_fps},
-	{"get_model_meta", get_model_meta},
 	{"start_mp4_record", start_mp4_record},
 	{"stop_mp4_record", stop_mp4_record},
 	{"mp4_record_status", mp4_record_status},
@@ -900,9 +673,6 @@ void *ai_thread(void *bs_filename)
 	bitrate_ctrl_init(&b_ctrl, 1500000, 30);
 	read_bitstream((char *)bs_filename, &video_bitstream, &video_bs_size);
 	read_bitstream("sound.raw", &audio_bitstream, &audio_bs_size);
-	//read_json("sysinfo.json", json_vec);
-	read_json("oid.json", json_vec);
-	//read_json("hand.json", json_vec);
 
 	// printf("video size: %zu\n", video_bs_size);
 	// printf("audio size: %zu\n", audio_bs_size);
