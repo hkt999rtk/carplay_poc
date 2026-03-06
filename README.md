@@ -1,17 +1,28 @@
-# tinyhttpd
+# tinyhttpd / carplay_poc
 
-`tinyhttpd` 是一個用於嵌入式 AI Demo 的小型伺服器專案，包含兩個必需服務：
+這個 repo 目前包含兩條主要服務：
 
-- HTTP 服務：提供 Web UI 與靜態資源（`amebatest`）
-- WebSocket 服務：提供 H.264/AI 事件串流與控制命令（`wsh264`）
+- `amebatest`: HTTP server，提供 `htdocs/` 前端頁面，預設 port `9090`
+- `wsh264`: WebSocket server，提供控制命令與 ChaCha20 加密後的 audio/video bitstream，預設 port `8081`
 
-前端頁面在 `htdocs/`，主要透過 `ws://<host>:8081` 與後端互動。
+另外在 `ws_server/` 內新增了兩個本機測試 binary：
 
-## 快速開始
+- `gateway`: 收到下游 client 後，才向 `wsh264` 建立 upstream websocket 連線，解密後轉成 framed byte stream
+- `gateway_client`: 連到 `gateway`，在 host 上直接播放 H.264 video 與 PCM audio
 
-`ws_server/` 已經直接放在 repo 內，不需要額外初始化 submodule。
+完整協議與設計說明在 [ws_server/SPEC.md](/Users/kevinhuang/work/carplay_poc/ws_server/SPEC.md)。
 
-### 1) 編譯 HTTP 服務 (`amebatest`)
+## 初始化
+
+`ws_server/third_party/chacha` 現在是 submodule，clone 後先做：
+
+```bash
+git submodule update --init --recursive
+```
+
+## Build
+
+### HTTP server
 
 ```bash
 cd build
@@ -19,7 +30,7 @@ cmake ..
 make
 ```
 
-### 2) 編譯 WebSocket 服務 (`wsh264`)
+### WebSocket server / relay / client
 
 ```bash
 cd ws_server/build
@@ -27,111 +38,89 @@ cmake ..
 make
 ```
 
-### 3) 啟動服務
+這會編出：
 
-需要同時啟動兩個服務：
+- `wsh264`
+- `gateway`
+- `gateway_client`
+- `crypto_proto_tests`
 
-1. 啟動 WebSocket 服務（port `8081`）  
-   `wsh264` 需要一個 H.264 bitstream 檔案參數。
+## 直接跑 browser
+
+先啟動 `wsh264`：
 
 ```bash
-cd ws_server/build
-./wsh264 ameba_pro_640_360.h264
-# 或使用測試資料
-# ./wsh264 ../test_data/iphone_baseline.h264
+cd ws_server/test_data
+../build/wsh264 iphone_baseline.h264
 ```
 
-2. 啟動 HTTP 服務（port `9090`）
+再啟動 HTTP server：
 
 ```bash
 cd build
 ./amebatest
 ```
 
-3. 開啟瀏覽器
+瀏覽器打開：
 
 ```text
-http://localhost:9090
+http://127.0.0.1:9090/main.html
 ```
 
-## 測試流程 (Smoke Test)
+browser 會直接連到 `ws://127.0.0.1:8081`，先收 `crypto_init`，再由 JavaScript 解密 binary media packet 並顯示。
 
-以下流程用來快速確認「HTTP 路由 / WebSocket / 前端解碼」都正常：
+## 跑 relay pipeline
 
-### 1) 驗證 HTTP 路由
+### 1. 啟動 `wsh264`
 
 ```bash
-curl -s -D - http://127.0.0.1:9090/ -o /dev/null | sed -n '1,8p'
-curl -s -D - http://127.0.0.1:9090/main.html -o /dev/null | sed -n '1,8p'
+cd ws_server/test_data
+../build/wsh264 iphone_baseline.h264
 ```
 
-預期：
-- `GET /` 回 `302 Found`，且 `Location: /main.html`
-- `GET /main.html` 回 `200 OK`
-
-### 2) 驗證 WebSocket 服務有在 listening
+### 2. 啟動 `gateway`
 
 ```bash
-lsof -iTCP:8081 -sTCP:LISTEN -n -P
+cd ws_server/build
+./gateway --listen-port 19000 --upstream-host 127.0.0.1 --upstream-port 8081
 ```
 
-預期：可看到 `wsh264` listening 在 `*:8081`。
-
-### 3) 驗證前端是否成功連線並解碼
-
-1. 開啟瀏覽器進入 `http://127.0.0.1:9090/main.html`
-2. 打開 DevTools Console
-3. 觀察以下訊息
-
-預期：
-- 若支援原生解碼：`WebCodecs enabled, codec = ...`
-- 若不支援：會自動 fallback 到 WASM 解碼
-
-## 主要模組
-
-- `minihttpd.cpp` / `minihttpd.h`
-  - tiny HTTP server 核心
-  - callback 路由機制
-  - 多 worker thread 處理連線
-
-- `genbin/`
-  - 將 `htdocs/` 打包成 `htdocs.bin`，再轉成 `ameba/htdocs_bin.c`
-  - 文字類型資源（html/css/js/wasm/map）會 gzip 後嵌入
-
-- `ameba/`
-  - 以 `htdocs_bin.c` 註冊靜態路由
-  - `/` 會 302 到 `/main.html`
-  - 目前範例主程式使用 `httpd_start(9090, ...)`
-
-- `ws_server/`（local directory）
-  - WebSocket 協定與事件處理
-  - `wsh264` 範例會讀取本地測試資料（H.264、`sound.raw`、`oid.json`）並推送到前端
-  - 支援命令如 `start_stream`、`stop_stream`、`get_model_status`、`get_version`、`get_config` 等
-
-## 常用命令
+### 3. 啟動 `gateway_client`
 
 ```bash
-# 重新編譯 HTTP 服務
-cd build && cmake .. && make
-
-# 重新編譯 WebSocket 服務
-cd ws_server/build && cmake .. && make
+cd ws_server/build
+./gateway_client --host 127.0.0.1 --port 19000
 ```
 
-## 專案結構
+`gateway` 只有在下游 client 連上後才會連 `wsh264`。同一時間只接受一個下游 client，多餘連線會直接拒絕。
 
-```text
-.
-├── minihttpd.cpp / minihttpd.h   # HTTP core
-├── genbin/                        # static asset packer
-├── htdocs/                        # web UI
-├── ameba/                         # embedded target app
-├── ministd/                       # lightweight STL-like containers
-└── ws_server/                     # websocket server (vendored local directory)
+## Tests
+
+```bash
+cd ws_server/build
+ctest --output-on-failure
 ```
 
-## 注意事項
+目前測試包含：
 
-- 目前 README 內容以現行程式碼為準：HTTP 預設埠是 `9090`（不是 `8080`）。
-- 如果只開 HTTP 不開 WebSocket，頁面可載入但 AI 串流與控制功能不會正常。
-- `wsh264` 若沒有提供 bitstream 參數，會直接印出 usage 並結束。
+- native ChaCha / packet framing round-trip
+- browser-side JavaScript decrypt helper
+- `from_scratch` 既有 websocket 測試
+
+## Low-latency behavior
+
+這版設計明確偏向低延遲，不做 AV sync：
+
+- 不做 playout timestamp 排程
+- 不做 packet reordering
+- `gateway_client` 會偏向保留最新 video packet
+- audio queue 過深時會直接丟掉舊資料，避免延遲持續累積
+
+## 專案重點路徑
+
+- `htdocs/`, `htdocs_full/`: browser UI 與 JS player
+- `ws_server/wsh264/`: websocket server 與 upstream media source
+- `ws_server/gateway/`: relay binary
+- `ws_server/gateway_client/`: host playback client
+- `ws_server/include/crypto_stream.h`: upstream crypto packet format
+- `ws_server/include/gateway_proto.h`: downstream framed relay protocol

@@ -1,0 +1,3 @@
+[submodule "ws_server/third_party/chacha"]
+	path = ws_server/third_party/chacha
+	url = git@github.com-work:hkt999rtk/chacha.git

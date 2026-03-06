@@ -9,9 +9,14 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <cJSON.h>
+#include "crypto_stream.h"
 #include "myvector.hpp"
 #include "mystring.hpp"
 #include "bitrate_ctrl.h"
+
+extern "C" {
+#include "base64.h"
+}
 
 static bitrate_ctrl_t b_ctrl;
 
@@ -41,7 +46,87 @@ typedef struct app_t_ {
 	int state;
 	pthread_t thread;
 	ws_cli_conn_t *conn; // bidirectional link
+	pthread_mutex_t crypto_lock;
+	uint8_t session_nonce[CRYPTO_STREAM_NONCE_SIZE];
+	uint32_t media_seq;
+	int crypto_init_sent;
 } app_t;
+
+static int send_crypto_init_locked(app_t *app)
+{
+	unsigned char *encoded = NULL;
+	char *clean = NULL;
+	size_t encoded_len = 0;
+	size_t clean_len = 0;
+	char json[256];
+
+	if (app->crypto_init_sent)
+		return 0;
+
+	encoded = base64_encode(app->session_nonce, CRYPTO_STREAM_NONCE_SIZE, &encoded_len);
+	if (encoded == NULL)
+		return -1;
+
+	clean = (char *)malloc(encoded_len + 1u);
+	if (clean == NULL) {
+		free(encoded);
+		return -1;
+	}
+	for (size_t i = 0; i < encoded_len; ++i) {
+		if (encoded[i] != '\n' && encoded[i] != '\r')
+			clean[clean_len++] = (char)encoded[i];
+	}
+	clean[clean_len] = '\0';
+	snprintf(json, sizeof(json),
+		 "{\"type\":\"crypto_init\",\"result\":{\"status\":\"ok\",\"cipher\":\"chacha20\",\"protocol_version\":1,\"key_id\":\"carplay-poc-static-v1\",\"session_nonce\":\"%s\"}}",
+		 clean);
+	free(clean);
+	free(encoded);
+
+	if (ws_sendframe(app->conn, json, strlen(json), WS_FR_OP_TXT) < 0)
+		return -1;
+	app->crypto_init_sent = 1;
+	return 0;
+}
+
+static int send_encrypted_media(app_t *app, uint8_t stream_id,
+				const uint8_t *payload, size_t payload_len)
+{
+	uint8_t *packet;
+	size_t packet_size;
+	uint32_t seq_no;
+	int encoded_size;
+	int rc;
+
+	if (app == NULL || payload == NULL)
+		return -1;
+
+	packet_size = crypto_stream_packet_size(payload_len);
+	packet = (uint8_t *)malloc(packet_size);
+	if (packet == NULL)
+		return -1;
+
+	pthread_mutex_lock(&app->crypto_lock);
+	rc = send_crypto_init_locked(app);
+	seq_no = app->media_seq++;
+	pthread_mutex_unlock(&app->crypto_lock);
+	if (rc != 0) {
+		free(packet);
+		return -1;
+	}
+
+	encoded_size = crypto_stream_encrypt_packet(
+		packet, packet_size, stream_id, seq_no, app->session_nonce,
+		payload, payload_len);
+	if (encoded_size < 0) {
+		free(packet);
+		return -1;
+	}
+
+	rc = ws_sendframe(app->conn, (const char *)packet, (uint64_t)encoded_size, WS_FR_OP_BIN);
+	free(packet);
+	return rc;
+}
 
 size_t check_size(uint8_t *start, size_t size)
 {
@@ -237,9 +322,6 @@ void *audio_streaming(void *data) // 16k, 16bits, mono
 	int size = audio_bs_size;
 	int slice = 640;
 	int cursor = 0;
-	unsigned char *output = (unsigned char *)malloc(slice+2);
-	output[0] = 0x00;
-	output[1] = 0xff;
 	for (;;) {
 		if ((app->state & STATE_CLOSING_AUDIO) == STATE_CLOSING_AUDIO)
 			break;
@@ -247,9 +329,7 @@ void *audio_streaming(void *data) // 16k, 16bits, mono
 		if (cursor + slice > size) {
 			cursor = 0;
 		}
-		memcpy(&output[2], &start[cursor], slice);
-		//ws_sendframe(app->conn, (const char *)&start[cursor], slice, WS_FR_OP_BIN);
-		ws_sendframe(app->conn, (const char *)output, slice, WS_FR_OP_BIN);
+		send_encrypted_media(app, CRYPTO_STREAM_ID_AUDIO, &start[cursor], slice);
 		cursor += slice;
 		usleep(20000); // 10ms
 
@@ -309,23 +389,7 @@ void *h264_streaming(void* data)
 		size -= ((chunk.start - start) + chunk.size);
 		start = chunk.start + chunk.size;;
 
-#if 1 // MULTIPLE-STREAM
-		uint8_t *pbuf = (uint8_t *)malloc(2+chunk.size);
-		memcpy(pbuf+2, chunk.start, chunk.size);
-		pbuf[0] = 0x00;
-		pbuf[1] = 0xfe;
-		ws_sendframe(app->conn, (const char *)pbuf, (int)chunk.size+2, WS_FR_OP_BIN);
-
-		if (app->state & STATE_STREAMING_VIDEO2) {
-			pbuf[0] = 0x00;
-			pbuf[1] = 0xfd;
-			ws_sendframe(app->conn, (const char *)pbuf, (int)chunk.size+2, WS_FR_OP_BIN);
-		}
-		
-		free(pbuf);
-#else
-		ws_sendframe(app->conn, (const char *)chunk.start, (int)chunk.size, WS_FR_OP_BIN);
-#endif
+		send_encrypted_media(app, CRYPTO_STREAM_ID_VIDEO, chunk.start, chunk.size);
 
 		// video events
 		/*
@@ -529,10 +593,6 @@ static void stop_model(ws_cli_conn_t *conn, cJSON *obj)
 	}
 	#endif
 }
-
-extern "C" {
-	unsigned char * base64_encode(const unsigned char *src, size_t len, size_t *out_len);
-};
 
 static void reg_face(ws_cli_conn_t *conn, cJSON *obj)
 {
@@ -781,6 +841,8 @@ static void onopen(ws_cli_conn_t *client)
 	memset(app, 0, sizeof(app_t));
 
 	app->state = STATE_IDLE;
+	crypto_stream_fill_random(app->session_nonce, sizeof(app->session_nonce));
+	pthread_mutex_init(&app->crypto_lock, NULL);
 	printf("set user data ! %p\n", (void *)app);
 	set_userdata(client, app);
 	printf("set user data ok !\n");
@@ -796,6 +858,7 @@ void onclose(ws_cli_conn_t *client)
 	stop_video_stream(client, NULL);
 	stop_audio_stream(client, NULL);
 
+	pthread_mutex_destroy(&app->crypto_lock);
 	free(app);
 }
 

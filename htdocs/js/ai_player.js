@@ -1671,6 +1671,7 @@ class CommandLink extends WebSocket {
         this.playingVideo2 = false
         this.firmwareVersion = "N/A"
         this.binaryType = 'arraybuffer' // setup the websocket binary type
+        this.cryptoSession = new CryptoStream.StreamSession()
         this.gopAccu = 60
         this.fps = 20
         this.averageFrameSize = 0
@@ -1717,27 +1718,24 @@ class CommandLink extends WebSocket {
         };
         this.onmessage = (evt) => {
             if (evt.data instanceof ArrayBuffer) {
-                let byteArray = new Uint8Array(evt.data)
-                if (byteArray.at(0) == 0 && byteArray.at(1) == 255) {
-                    // audio stream
+                let decoded = null
+                try {
+                    decoded = this.cryptoSession.decryptBinary(evt.data)
+                } catch (err) {
+                    console.log("drop encrypted packet:", err.message)
+                }
+                if (decoded == null) {
+                    return
+                }
+                if (decoded.streamId === CryptoStream.STREAM_AUDIO) {
                     if (this.audioPlayer != null) {
-                        let audioData = new Int16Array(evt.data, 2, Math.floor(evt.data.byteLength / 2 - 1)); // skip the leading 2 bytes
+                        let audioData = new Int16Array(decoded.payload.buffer, decoded.payload.byteOffset, Math.floor(decoded.payload.byteLength / 2))
                         this.audioPlayer.setupData(audioData);
                     }
-                } else if (byteArray.at(0) == 0 && byteArray.at(1) == 0xfd) { // channel 2
-                    if (this.videoPlayer2 != null) {
-                        let b = new Uint8Array(evt.data, 2, evt.data.byteLength - 2)
-                        this.videoPlayer2.decode(b)
-                    }
-                } else {
+                } else if (decoded.streamId === CryptoStream.STREAM_VIDEO) {
                     if (this.videoPlayer != null) {
                         let nowTime = new Date();
-                        let b;
-                        if (byteArray.at(0) == 0 && byteArray.at(1) == 0xfe) { // channel 2
-                            b = new Uint8Array(evt.data, 2, evt.data.byteLength - 2);
-                        } else {
-                            b = new Uint8Array(evt.data, 0, evt.data.byteLength);
-                        }
+                        let b = decoded.payload
                         if (this.useNativeVideoDecoder && this.nativeVideoDecoder != null) {
                             if (this.nativeVideoDecoder.pushNal(b) == false) {
                                 this.videoPlayer.decode(b);
@@ -1747,7 +1745,6 @@ class CommandLink extends WebSocket {
                         }
                         let nal_type = b[0] & 0x1f;
                         if (nal_type == 5) { // IDR
-                            // update icost and keep average bitrate
                             if (this.gopAccu == 0) {
                                 this.gopAccu = 30;
                             }
@@ -1763,6 +1760,9 @@ class CommandLink extends WebSocket {
                 }
             } else {
                 let obj = JSON.parse(evt.data);
+                if (this.cryptoSession.updateFromControl(obj)) {
+                    return
+                }
                 switch (obj.type) {
                     case "classification":
                         if (obj.result.status == "ok") {
