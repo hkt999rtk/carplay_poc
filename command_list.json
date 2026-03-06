@@ -1,0 +1,166 @@
+{
+    "cmd" : "start_stream",
+    "param" : {"mirror" : 1}
+}
+
+
+{
+    "cmd" : "stop_stream"
+}
+
+
+{
+    "cmd" : "start_model",
+    "param" : ["yolo4t", "retinaface", "mobilenetface", "yamnet", "object_tracking"]
+}
+
+
+{
+    "cmd" : "start_model",
+    "param" : ["yolo4t"]
+}
+
+
+{
+    "cmd" : "stop_model",
+    "param" : ["yolo4t", "retinaface", "mobilenetface", "yamnet"]
+}
+
+
+{
+    "cmd" : "stop_model",
+    "param" : ["yolo4t"]
+}
+
+
+{
+    "cmd" : "get_model_status"
+}
+{
+    "type": "get_model_status",
+    "result": {
+        "value" : [ {"yolo4t" : "running", "fps" : 6},
+                    {"retinaface" : "stop", "fps" : 0},
+                    {"mobilenetface" : "stop", "fps" : 0},
+                    {"yamnet" : "running", "fps" : 6}
+                ]
+    }         
+}
+
+
+{
+    "cmd" : "get_version"
+}
+{
+    "type": "get_version",
+    "result": {
+        "value" : ["1.0.0"]
+    }         
+}
+
+
+{
+    "cmd" : "reg_face",
+}
+{
+    "type": "reg_face",
+    "result": {
+        "status": "ok",
+        "value" : {"faceid" : 123, "name" : "Guest1", "thumbnail" : "rgb888_base64", "total_face" : 3}
+    }
+}
+{
+    "type": "reg_face",
+    "result": {
+        "status": "fail",
+        "error_code" : 123
+    }         
+}
+
+
+{
+    "cmd" : "rename_face",
+    "param" : {"faceid" : 123, "name" : "Kevin Huang"}
+}
+
+
+{
+    "cmd" : "unreg_face",
+    "param" : {"faceid" : 123}
+}
+
+
+{
+    "cmd" : "unreg_allface"
+}
+
+
+{
+    "cmd" : "get_reg_face"
+}
+{
+    "type": "get_reg_face",
+    "result": {
+        "value" : [ {"faceid" : 123, "name" : "Kevin Huang"},
+                    {"faceid" : 456, "name" : "Neo"},
+                    {"faceid" : 789, "name" : "Cathy"}
+                  ]
+    }         
+}
+
+
+{
+    "cmd" : "save_reg_face",
+    "__comment" : "Save reg config to flash"
+}
+
+
+{
+    "cmd" : "set_kf_matrix",
+    "param" : [1.0, 0.5, 0.1, 0, 0.5, 0, 0, 0, 0.5]
+}
+
+{
+    "cmd" : "set_kf_noise",
+    "param" : [0.1, 0.1]
+}
+
+
+{
+    "cmd" : "smart_exposure",
+    "param" : {"target" : 134}
+}
+
+{
+    "cmd" : "ircut",
+    "param" : {"on" : 0} //0:night mode 1:day mode
+}
+
+{
+    "cmd" : "object_detect",
+    "param" : {"confidence": 50, "nms_thresh": 30} //confidence: 1~100, nms_thresh: 1~100
+}
+
+{
+    "cmd" : "md",
+    "param" : {"enable":1, "Tbase": 2, "Tlum": 3, "obj_sensitivity": 90}
+}
+
+//Tbase: motion detect base threshold : smaller value, higher sensitive
+//Tlum: motion detect threshold : smaller value, higher sensitive to light change
+//dynamic_thr: enable dnamic threshold
+//trigger_blocks: md triggered when at least n motion block triggered
+{
+    "type": "md_result",
+    "result": {
+        "value" : [ {"xmin" : 0.123, "ymin" : 0.456, "xmax" : 0.145, "ymax" : 0.789},
+                    {"xmin" : 0.123, "ymin" : 0.456, "xmax" : 0.145, "ymax" : 0.789},
+                    {"xmin" : 0.123, "ymin" : 0.456, "xmax" : 0.145, "ymax" : 0.789}
+                  ]
+    }         
+}
+
+{
+    "cmd" : "isp_fps",
+    "param" : {"isp_fps":24}
+}

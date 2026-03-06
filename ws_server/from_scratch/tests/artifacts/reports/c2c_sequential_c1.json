@@ -1,0 +1,37 @@
+{
+  "scenario": "c_server_c_client",
+  "mode": "sequential",
+  "client_count": 1,
+  "stagger_ms": 50,
+  "status": "passed",
+  "duration_ms": 233,
+  "server": {
+    "connections_opened": 1,
+    "connections_closed": 1,
+    "initial_text_sent": 120,
+    "initial_binary_sent": 120,
+    "text_received": 120,
+    "binary_received": 120,
+    "text_echoed": 120,
+    "binary_echoed": 120,
+    "last_close_code": 1006,
+    "error": false
+  },
+  "clients": [
+    {
+      "client_id": 0,
+      "initial_text_received": 120,
+      "initial_binary_received": 120,
+      "text_echoes_received": 120,
+      "binary_echoes_received": 120,
+      "close_code": 1000,
+      "status": "passed"
+    }
+  ],
+  "client_aggregate": {
+    "initial_text_received": 120,
+    "initial_binary_received": 120,
+    "text_echoes_received": 120,
+    "binary_echoes_received": 120
+  }
+}

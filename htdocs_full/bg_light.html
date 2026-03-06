@@ -1,0 +1,145 @@
+<html lang="en" class="h-100">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="">
+    <title>Ameba PRO2 AI DEMO</title>
+    <link href="/css/bootstrap.min.css" rel="stylesheet">
+    <link href="/css/cover.css" rel="stylesheet">
+    <link href="/css/ai_canvas.css" rel="stylesheet">
+    <link href="/css/font-awesome.min.css" rel="stylesheet">
+    <link href="/img/favicon.ico" rel="shortcut icon">
+    <script type="text/javascript" src="/js/jquery-3.6.0.min.js"></script>
+    <script type="text/javascript" src="/js/bootstrap.min.js"></script>
+    <script type="text/javascript" src="/js/ai_param.js"></script>
+  </head>
+
+  <body class="d-flex h-100 text-center text-white bg-dark">
+    <div class="cover-container d-flex w-100 h-100 p-3 mx-auto flex-column">
+      <header class="mb-auto">
+        <div>
+          <h3 class="float-md-start mb-0">Background Light Simulation</h3>
+          <nav id="menu" class="nav nav-masthead justify-content-center float-md-end"> </nav>
+        </div>
+      </header>
+
+      <main class="px-3">
+        <div style="position: relative; width: 85%; margin: auto">
+          <canvas class='video_canvas' id='light_canvas' width="100%" height="60%" style="background-color: black;"></canvas>
+          <div style="position: absolute; top: 20%; left: 20%; width: 60%; height: 60%;">
+            <canvas class='video_canvas' id='output_canvas' width="1920" height="1080" style="background-color: #333333; width: 100%; height: 100%;"></canvas>
+          </div>
+        </div>
+      </main>
+
+      <footer id="footer" class="mt-auto text-white-50"> </footer>
+    </div>
+  </body>
+
+  <script type="text/javascript" src="/js/create_bl_player.js"></script>
+	<script type="text/javascript" src="/js/menu.js"></script>
+	<script type="text/javascript" src="/js/decoder.js"></script>
+	<script type="text/javascript" src="/js/yuv_canvas.js"></script>
+	<script type="text/javascript" src="/js/player.js"></script>
+	<script type="text/javascript" src="/js/ai_player.js"></script>
+  <script type="text/javascript">
+    document.addEventListener('keydown', function(event) {
+      if (event.key == "PageUp") {
+      }
+    });
+
+    getAverageRGB = (ctx, x, y, width, height, step) => {
+      let imageData = ctx.getImageData(x, y, width, height);
+      let data = imageData.data;
+      let r = 0, g = 0, b = 0;
+      let count = 0;
+
+      // loop through each pixel
+      for (let i = 0; i < width; i += step) {
+          for (let j = 0; j < height; j += step) {
+              let pos = (i + j * width) * 4;
+              r += data[pos];     // red
+              g += data[pos + 1]; // green
+              b += data[pos + 2]; // blue
+              count++;
+          }
+      }
+
+      // calculate averages
+      r = Math.round(r / count);
+      g = Math.round(g / count);
+      b = Math.round(b / count);
+
+      return {r: r, g: g, b: b};
+    }
+
+    getBlockAverageRGB = (canvas, x_ratio, y_ratio) => {
+      let ctx = canvas.getContext('2d');
+      let blockWidth = canvas.width / 10;
+      let blockHeight = canvas.height / 6;
+      let blockX = Math.floor((canvas.width * x_ratio/100) / blockWidth);
+      let blockY = Math.floor((canvas.height * y_ratio/100) / blockHeight);
+      let startX = blockX * blockWidth;
+      let startY = blockY * blockHeight;
+      let averageRGB = getAverageRGB(ctx, startX, startY, blockWidth, blockHeight, 4);
+      return `rgba(${averageRGB.r}, ${averageRGB.g}, ${averageRGB.b}, 0.6)`;
+    }
+
+
+    drawLightCanvas = () => {
+      let lightCanvas = document.getElementById('light_canvas');
+      let videoCanvas = document.getElementById('output_canvas');
+      let ctx = lightCanvas.getContext('2d');
+      let start_x = lightCanvas.width * 0.2; // 20%
+      let start_y = lightCanvas.height * 0.2; // 20%
+      let end_x = lightCanvas.width * 0.8; // 80%
+      let end_y = lightCanvas.height * 0.8; // 80%
+
+      let iy = 0; let ix = 0;
+      let width_step = lightCanvas.width * 0.6 / 100;
+      let height_step = lightCanvas.height * 0.6 / 100;
+      ctx.clearRect(0, 0, lightCanvas.width, lightCanvas.height);
+
+      let radius = 17;
+      for (iy = 0; iy <= 100; iy += 10) {
+        let y = start_y + iy * height_step;
+        let gradient = ctx.createRadialGradient(start_x, y, 0, start_x, y, radius);
+        gradient.addColorStop(0, getBlockAverageRGB(videoCanvas, 0, y));
+        gradient.addColorStop(1, 'transparent');
+        ctx.beginPath();
+        ctx.arc(start_x, y, radius, 0, 2 * Math.PI);
+        ctx.fillStyle = gradient;
+        ctx.fill();
+
+        gradient = ctx.createRadialGradient(end_x, y, 0, end_x, y, radius);
+        gradient.addColorStop(0, getBlockAverageRGB(videoCanvas, 98, y));
+        gradient.addColorStop(1, 'transparent');
+        ctx.beginPath();
+        ctx.arc(end_x, y, radius, 0, 2 * Math.PI);
+        ctx.fillStyle = gradient;
+        ctx.fill();
+      }
+      for (ix = 5.6; ix < 100; ix += 5.6) {
+        let x = start_x + ix * width_step;
+        let gradient = ctx.createRadialGradient(x, start_y, 0, x, start_y, radius);
+        gradient.addColorStop(0, getBlockAverageRGB(videoCanvas, x, 0));
+        gradient.addColorStop(1, 'transparent');
+        ctx.beginPath();
+        ctx.arc(x, start_y, radius, 0, 2 * Math.PI);
+        ctx.fillStyle = gradient;
+        ctx.fill();
+
+        gradient = ctx.createRadialGradient(x, end_y, 0, x, end_y, radius);
+        gradient.addColorStop(0, getBlockAverageRGB(videoCanvas, x, 98));
+        gradient.addColorStop(1, 'transparent');
+        ctx.beginPath();
+        ctx.arc(x, end_y, radius, 0, 2 * Math.PI);
+        ctx.fillStyle = gradient;
+        ctx.fill();
+      }
+    }
+
+    setInterval(drawLightCanvas, 100)
+  </script>
+</html>
+

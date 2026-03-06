@@ -1,0 +1,22 @@
+{
+  "scenario": "c_server_js_client",
+  "mode": "concurrent",
+  "client_count": 3,
+  "stagger_ms": 0,
+  "status": "passed",
+  "duration_ms": 44,
+  "server": {
+    "connections_opened": 3,
+    "connections_closed": 3,
+    "initial_text_sent": 360,
+    "initial_binary_sent": 360,
+    "text_received": 360,
+    "binary_received": 360,
+    "text_echoed": 360,
+    "binary_echoed": 360,
+    "last_close_code": 1006,
+    "error": false
+  }
+}
+
+}

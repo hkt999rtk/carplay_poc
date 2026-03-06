@@ -1,0 +1,22 @@
+{
+  "scenario": "c_server_js_client",
+  "mode": "sequential",
+  "client_count": 1,
+  "stagger_ms": 50,
+  "status": "passed",
+  "duration_ms": 46,
+  "server": {
+    "connections_opened": 1,
+    "connections_closed": 1,
+    "initial_text_sent": 120,
+    "initial_binary_sent": 120,
+    "text_received": 120,
+    "binary_received": 120,
+    "text_echoed": 120,
+    "binary_echoed": 120,
+    "last_close_code": 1006,
+    "error": false
+  }
+}
+
+}

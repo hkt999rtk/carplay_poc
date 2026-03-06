@@ -1,0 +1,185 @@
+#include <stdint.h>
+#include <stdlib.h>
+#include <string>
+#include "osd.h"
+
+using namespace std;
+
+RemoteOSD::RemoteOSD()
+{
+    m_cmdCount = 0;
+    m_keyCount = 0;
+    m_buf = "{\"type\":\"osd\", \"ver\":\"0.1\",\"serial\":[";
+}
+
+RemoteOSD::~RemoteOSD()
+{
+}
+
+void RemoteOSD::startCmd()
+{
+    if (m_cmdCount>0) {
+        m_buf += ",{";
+    } else {
+        m_buf += "{";
+    }
+    m_cmdCount++;
+    m_keyCount = 0;
+}
+
+void RemoteOSD::endCmd()
+{
+    m_buf += "}";
+}
+
+void RemoteOSD::addValue(string key, string value)
+{
+    if (m_keyCount > 0) {
+        m_buf += ",";
+    }
+    m_buf += "\"" + key + "\":" + "\"" + value + "\"";
+    m_keyCount++;
+}
+
+void RemoteOSD::addValue(string key, int value)
+{
+    if (m_keyCount > 0) {
+        m_buf += ",";
+    }
+    m_buf += "\"" + key + "\":" + to_string(value);
+    m_keyCount++;
+}
+
+string RemoteOSD::getJson()
+{
+    return m_buf + "]}";
+}
+
+void RemoteOSD::strokeStyle(const char *style)
+{
+    startCmd();
+    addValue("c", "strokeStyle");
+    addValue("v", style);
+    endCmd();
+}
+
+void RemoteOSD::lineWidth(int w)
+{
+    startCmd();
+    addValue("c", "lineWidth");
+    addValue("v", w);
+    endCmd();
+}
+
+void RemoteOSD::fillStyle(const char *style)
+{
+    startCmd();
+    addValue("c", "fillStyle");
+    addValue("v", style);
+    endCmd();
+}
+
+void RemoteOSD::fillText(const char *text, int x, int y)
+{
+    startCmd();
+    addValue("c", "fillText");
+    addValue("v", text);
+    addValue("x", x);
+    addValue("y", y);
+    endCmd();
+}
+
+void RemoteOSD::rect(int x, int y, int w, int h)
+{
+    startCmd();
+    addValue("c", "rect");
+    addValue("x", x);
+    addValue("y", y);
+    addValue("w", w);
+    addValue("h", h);
+    endCmd();
+}
+
+void RemoteOSD::circle(int x, int y, int r)
+{
+    startCmd();
+    addValue("c", "circle");
+    addValue("x", x);
+    addValue("y", y);
+    addValue("r", r);
+}
+
+void RemoteOSD::fillRect(int x, int y, int w, int h)
+{
+    startCmd();
+    addValue("c", "fillRect");
+    addValue("x", x);
+    addValue("y", y);
+    addValue("w", w);
+    addValue("h", h);
+    endCmd();
+}
+
+void RemoteOSD::beginPath()
+{
+    startCmd();
+    addValue("c", "beginPath");
+    endCmd();
+}
+
+void RemoteOSD::stroke()
+{
+    startCmd();
+    addValue("c", "stroke");
+    endCmd();
+}
+
+void RemoteOSD::fill()
+{
+    startCmd();
+    addValue("c", "fill");
+    endCmd();
+}
+
+void RemoteOSD::font(int size, const char *fontName)
+{
+    startCmd();
+    addValue("c", "font");
+    addValue("s", size);
+    addValue("v", fontName);
+    endCmd();
+}
+
+void RemoteOSD::globalAlpha(int alpha) 
+{
+    startCmd();
+    addValue("c", "globalAlpha");
+    addValue("v", alpha);
+    endCmd();
+}
+
+const char *test_object_detection_osd()
+{
+    static string s = "{\"type\": \"object_detection\",\"result\": {\"status\":\"ok\",\"elapsed_time\":1817,\"model\":\"yolov4-416-fp32-3\",\"width\":1920,\"height\":1080,\"score\":60,\"iou\":60,\"detection\":[{\"minx\":401,\"maxx\":546,\"miny\":302,\"maxy\":433,\"score\":99,\"id\":2,\"class\":\"car\"}]}}";
+    return s.c_str();
+}
+
+const char *test_osd()
+{
+    RemoteOSD osd;
+
+    osd.beginPath();
+    osd.strokeStyle("red");
+    osd.lineWidth(6);
+    osd.rect(100, 100, 300, 300);
+    osd.stroke();
+    osd.fillStyle("blue");
+    osd.fillRect(150, 150, 250, 200);
+    osd.fillStyle("green");
+    osd.font(60, "Arial");
+    osd.fillText("HELLO, OSD", 50, 50);
+
+    // output string
+    static string s = osd.getJson();
+    return s.c_str();
+}

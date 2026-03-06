@@ -1,0 +1,13 @@
+{
+  "name": "wsfs-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start-server": "node src/server.js",
+    "start-client": "node src/client.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "scenario": "js_server_c_client",
+  "mode": "sequential",
+  "client_count": 2,
+  "stagger_ms": 50,
+  "status": "passed",
+  "duration_ms": 106,
+  "server": {
+    "connectionsOpened": 2,
+    "connectionsClosed": 2,
+    "initialTextSent": 240,
+    "initialBinarySent": 240,
+    "clientTextReceived": 240,
+    "clientBinaryReceived": 240,
+    "textEchoed": 240,
+    "binaryEchoed": 240,
+    "error": null,
+    "clients": [
+      {
+        "clientId": 0,
+        "initialTextSent": 120,
+        "initialBinarySent": 120,
+        "clientTextReceived": 120,
+        "clientBinaryReceived": 120,
+        "textEchoed": 120,
+        "binaryEchoed": 120,
+        "closeCode": 1000,
+        "error": null
+      },
+      {
+        "clientId": 1,
+        "initialTextSent": 120,
+        "initialBinarySent": 120,
+        "clientTextReceived": 120,
+        "clientBinaryReceived": 120,
+        "textEchoed": 120,
+        "binaryEchoed": 120,
+        "closeCode": 1000,
+        "error": null
+      }
+    ]
+  }
+}

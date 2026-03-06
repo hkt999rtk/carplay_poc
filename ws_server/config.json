@@ -1,0 +1,130 @@
+{ "type":"get_config", "result": { "model_config" : [
+  {
+      "filename": "retinaface025_360_640_uint8.nb",
+      "model_size": 753216,
+      "rgb_packed": 0,
+      "score_threshold": 0.8,
+      "nms_iou_threshold": 0.3,
+      "type": 3,
+      "_type_comment": "0:ssd-mobilenet v1, 1:yolov3-tiny/yolov4-tiny, 2:YAMNet-S, 3:Retinaface025, 4:MobileFaceNet, 5:YAMNet 1.0 full, 6:yolov4-tiny-person-car tracking",
+      "input_width": 640,
+      "input_height": 360,
+      "output_bbox_num": 0,
+      "input_channels": 3
+  },
+  {
+    "filename": "mobilefacenet_int16.nb",
+    "model_size": 3765504,
+    "rgb_packed": 0,
+    "score_threshold": 70.0,
+    "nms_iou_threshold": 0.5,
+    "type": 4,
+    "input_width": 112,
+    "input_height": 112,
+    "output_bbox_num": 0,
+    "input_channels": 3
+},
+{
+    "1_filename": "yolo-fastest-1.1.nb",
+    "1_anchor_box": [12, 18,  37, 49,  52,132, 115, 73, 119,199, 242,238],
+
+    "2_filename": "yolo-fastest-1.1-xl.nb",
+    "2_anchor_box": [12, 18,  37, 49,  52,132, 115, 73, 119,199, 242,238],
+
+    "3_filename": "yolo-fastest-1.1_body.nb",
+    "3_anchor_box":[7, 17,  20, 50,  45, 99,  64,187, 123,211, 227,264],
+
+    "4_filename": "yolo-fastest-1.1_rtk_640_352.nb",
+    "4_anchor_box": [12, 19,  32, 52,  69,108, 104,199, 212,228, 447,269],
+
+    "5_filename": "yolov4_tiny.nb",
+    "5_anchor_box":[23,27,  37,58,  81,82,  81,82,  135,169,  344,319],
+
+    "6_filename": "yolov4_tiny_hybrid_SD9.nb",
+    "6_anchor_box":[23,27,  37,58,  81,82,  81,82,  135,169,  344,319],
+
+    "filename": "yolov4_tiny.nb",
+    "anchor_box":[23,27,  37,58,  81,82,  81,82,  135,169,  344,319],
+
+    "rgb_packed": 0,
+    "score_threshold": 0.5,
+    "nms_iou_threshold": 0.3,
+    "type": 1,
+    "input_width": 416,
+    "input_height": 416,
+    "output_bbox_num": 0,
+    "input_channels": 3
+},
+{
+    "filename": "yamnet_10_u8.nb",
+    "rgb_packed": 0,
+    "score_threshold": 0.5,
+    "nms_iou_threshold": 0.1,
+    "type": 5,
+    "input_width": 64,
+    "input_height": 96,
+    "output_bbox_num": 0,
+    "input_channels": 1
+},
+{
+    "filename22": "scrfd_500m_bnkps_576x320_u8.nb",
+    "filename": "scrfd_500m_bnkps_640x640_u8.nb",
+    "rgb_packed": 0,
+    "score_threshold": 0.2,
+    "nms_iou_threshold": 0.3,
+    "type": 7,
+    "_type_comment": "0:ssd-mobilenet v1, 1:yolov3/yolov4, 2:yolov3-tiny/yolov4-tiny, 3:YAMNet, 4:Retinaface025",
+    "input_width22": 576,
+    "input_height22": 320,
+    "input_width": 640,
+    "input_height": 640,
+    "output_bbox_num": 0,
+    "input_channels": 3
+}],
+  "object_tracking" : {
+    "kf_matrix" : [1.0, 1.0, 0.2, 0.0, 1.0, 1.0, 0.0, 0.0, 0.3],
+    "kf_noise": [0.1, 0.1],
+    "kf_maxDistThreshold": 60,
+    "kf_maxUnrefCount": 2,
+    "kf_maxTracking": 12,
+    "tracking_target": ["person", "car"]
+  },
+
+  "net": {
+    "ssid": "RTK_AI_DEMO_CES",
+    "password": "12345678",
+    "channel": 161,
+    "_channel_list_2.4G": "1-11",
+    "_channel_list_5G_US": "36,38,40,42,44,46,48,149,153,157,161,165",
+    "_channel_list_5G_US_DFS": "52,56,60,64,100,104,108,112,116,132,136,140"
+  },
+
+  "video": [
+  {
+    "width": 1920,
+    "height": 1080,
+    "rc_mode": 1,
+    "_comment_rc_mode": "1: CBR, 2: VBR",
+    "bitrate": 1048576,
+    "fps": 30,
+    "gop": 30,
+    "min_qp": 1,
+    "max_qp": 51,
+    "delta_qp": 51,
+    "recmp4": 1
+  },
+  {
+    "width": 1280,
+    "height": 720,
+    "rc_mode": 1,
+    "_comment_rc_mode": "1: CBR, 2: VBR",
+    "bitrate": 524288,
+    "fps": 30,
+    "gop": 30,
+    "min_qp": 1,
+    "max_qp": 51,
+    "delta_qp": 51,
+    "recmp4": 1
+  }]
+}}
+

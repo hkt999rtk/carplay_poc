@@ -1,0 +1,25 @@
+{
+  "scenario": "js_server_c_client",
+  "mode": "concurrent",
+  "client_count": 1,
+  "stagger_ms": 0,
+  "status": "passed",
+  "duration_ms": 21,
+  "clients": [
+    {
+      "client_id": 0,
+      "initial_text_received": 120,
+      "initial_binary_received": 120,
+      "text_echoes_received": 120,
+      "binary_echoes_received": 120,
+      "close_code": 1000,
+      "status": "passed"
+    }
+  ],
+  "client_aggregate": {
+    "initial_text_received": 120,
+    "initial_binary_received": 120,
+    "text_echoes_received": 120,
+    "binary_echoes_received": 120
+  }
+}
