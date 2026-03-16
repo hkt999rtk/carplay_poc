@@ -1,17 +1,26 @@
 #include "ws_upstream_client.h"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <errno.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include "crypto_stream.h"
 #include "tcp_transport.h"
 
-static int ws_send_masked_frame(int fd, uint8_t opcode,
+static int ws_send_masked_frame(tcp_socket_t fd, uint8_t opcode,
 				const uint8_t *payload, size_t length)
 {
 	uint8_t header[14];
@@ -79,11 +88,20 @@ static int ws_read_some(ws_upstream_client_t *client, uint8_t *dest, size_t len)
 		}
 
 		{
-			ssize_t n = recv(client->fd, dest + copied, len - copied, 0);
+#ifdef _WIN32
+			int chunk = (int)((len - copied) > (size_t)INT_MAX ? INT_MAX : (int)(len - copied));
+			int n = recv((SOCKET)client->fd, (char *)(dest + copied), chunk, 0);
+#else
+			int n = (int)recv(client->fd, dest + copied, len - copied, 0);
+#endif
 			if (n == 0)
 				return 0;
 			if (n < 0) {
+#ifdef _WIN32
+				if (WSAGetLastError() == WSAEINTR)
+#else
 				if (errno == EINTR)
+#endif
 					continue;
 				return -1;
 			}
@@ -107,7 +125,7 @@ int ws_upstream_connect(ws_upstream_client_t *client, const char *host,
 
 	memset(client, 0, sizeof(*client));
 	client->fd = tcp_transport_connect(host, port);
-	if (client->fd < 0)
+	if (client->fd == TCP_TRANSPORT_INVALID_SOCKET)
 		return -1;
 
 	if (path == NULL)
@@ -133,7 +151,13 @@ int ws_upstream_connect(ws_upstream_client_t *client, const char *host,
 	}
 
 	while (total + 1u < sizeof(response)) {
-		ssize_t n = recv(client->fd, response + total, sizeof(response) - total - 1u, 0);
+#ifdef _WIN32
+		int chunk = (int)((sizeof(response) - total - 1u) > (size_t)INT_MAX ?
+				INT_MAX : (int)(sizeof(response) - total - 1u));
+		int n = recv((SOCKET)client->fd, response + total, chunk, 0);
+#else
+		int n = (int)recv(client->fd, response + total, sizeof(response) - total - 1u, 0);
+#endif
 		char *header_end;
 
 		if (n == 0) {
@@ -141,7 +165,11 @@ int ws_upstream_connect(ws_upstream_client_t *client, const char *host,
 			return -1;
 		}
 		if (n < 0) {
+#ifdef _WIN32
+			if (WSAGetLastError() == WSAEINTR)
+#else
 			if (errno == EINTR)
+#endif
 				continue;
 			ws_upstream_close(client);
 			return -1;
@@ -174,10 +202,10 @@ int ws_upstream_connect(ws_upstream_client_t *client, const char *host,
 	return -1;
 }
 
-int ws_upstream_fd(const ws_upstream_client_t *client)
+tcp_socket_t ws_upstream_fd(const ws_upstream_client_t *client)
 {
 	if (client == NULL)
-		return -1;
+		return TCP_TRANSPORT_INVALID_SOCKET;
 	return client->fd;
 }
 
@@ -270,5 +298,5 @@ void ws_upstream_close(ws_upstream_client_t *client)
 	client->prebuffer_len = 0;
 	client->prebuffer_off = 0;
 	tcp_transport_shutdown_close(client->fd);
-	client->fd = -1;
+	client->fd = TCP_TRANSPORT_INVALID_SOCKET;
 }

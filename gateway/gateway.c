@@ -1,11 +1,20 @@
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <errno.h>
+#include <sys/select.h>
+#include <unistd.h>
+#endif
+
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
-#include <unistd.h>
 
 #include "base64.h"
 #include "cJSON.h"
@@ -23,7 +32,7 @@ typedef struct gateway_runtime {
 
 typedef struct session_arg {
 	gateway_runtime_t *runtime;
-	int client_fd;
+	tcp_socket_t client_fd;
 } session_arg_t;
 
 static void gateway_set_active(gateway_runtime_t *runtime, int active)
@@ -114,7 +123,7 @@ static void *gateway_session_main(void *arg)
 {
 	session_arg_t *session = (session_arg_t *)arg;
 	gateway_runtime_t *runtime = session->runtime;
-	int client_fd = session->client_fd;
+	tcp_socket_t client_fd = session->client_fd;
 	ws_upstream_client_t upstream;
 	uint8_t session_nonce[CRYPTO_STREAM_NONCE_SIZE];
 	int have_nonce = 0;
@@ -123,7 +132,7 @@ static void *gateway_session_main(void *arg)
 	gateway_proto_init_info_t init_info;
 
 	memset(&upstream, 0, sizeof(upstream));
-	upstream.fd = -1;
+	upstream.fd = TCP_TRANSPORT_INVALID_SOCKET;
 
 	gateway_proto_default_init(&init_info);
 	if (gateway_proto_write_init(init_buf, &init_info) != 0)
@@ -144,27 +153,37 @@ static void *gateway_session_main(void *arg)
 
 	for (;;) {
 		fd_set rfds;
-		int max_fd = client_fd > ws_upstream_fd(&upstream) ? client_fd : ws_upstream_fd(&upstream);
+		tcp_socket_t upstream_fd = ws_upstream_fd(&upstream);
+		tcp_socket_t max_fd = client_fd > upstream_fd ? client_fd : upstream_fd;
 		int rc;
 
 		FD_ZERO(&rfds);
-		FD_SET(client_fd, &rfds);
-		FD_SET(ws_upstream_fd(&upstream), &rfds);
+		FD_SET((SOCKET)client_fd, &rfds);
+		FD_SET((SOCKET)upstream_fd, &rfds);
 
+#ifdef _WIN32
+		rc = select(0, &rfds, NULL, NULL, NULL);
+		if (rc < 0) {
+			if (WSAGetLastError() == WSAEINTR)
+				continue;
+			break;
+		}
+#else
 		rc = select(max_fd + 1, &rfds, NULL, NULL, NULL);
 		if (rc < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
 		}
+#endif
 
-		if (FD_ISSET(client_fd, &rfds)) {
+		if (FD_ISSET((SOCKET)client_fd, &rfds)) {
 			int status = tcp_transport_peek_status(client_fd);
 			if (status <= 1)
 				break;
 		}
 
-		if (FD_ISSET(ws_upstream_fd(&upstream), &rfds)) {
+		if (FD_ISSET((SOCKET)upstream_fd, &rfds)) {
 			uint8_t opcode = 0;
 			uint8_t *payload = NULL;
 			size_t payload_len = 0;
@@ -249,7 +268,7 @@ int main(int argc, char **argv)
 	uint16_t listen_port = 19000u;
 	uint16_t upstream_port = 8081u;
 	const char *upstream_host = "127.0.0.1";
-	int listen_fd;
+	tcp_socket_t listen_fd;
 	gateway_runtime_t runtime;
 
 	for (int i = 1; i < argc; ++i) {
@@ -273,7 +292,7 @@ int main(int argc, char **argv)
 	runtime.upstream_port = upstream_port;
 
 	listen_fd = tcp_transport_listen(listen_port, 8);
-	if (listen_fd < 0) {
+	if (listen_fd == TCP_TRANSPORT_INVALID_SOCKET) {
 		perror("gateway listen");
 		return 1;
 	}
@@ -282,8 +301,8 @@ int main(int argc, char **argv)
 	       (unsigned)listen_port, upstream_host, (unsigned)upstream_port);
 
 	for (;;) {
-		int client_fd = tcp_transport_accept(listen_fd);
-		if (client_fd < 0) {
+		tcp_socket_t client_fd = tcp_transport_accept(listen_fd);
+		if (client_fd == TCP_TRANSPORT_INVALID_SOCKET) {
 			perror("gateway accept");
 			continue;
 		}

@@ -3,13 +3,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "tcp_transport.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct ws_upstream_client {
-	int fd;
+	tcp_socket_t fd;
 	uint8_t *prebuffer;
 	size_t prebuffer_len;
 	size_t prebuffer_off;
@@ -17,7 +18,7 @@ typedef struct ws_upstream_client {
 
 int ws_upstream_connect(ws_upstream_client_t *client, const char *host,
 			uint16_t port, const char *path);
-int ws_upstream_fd(const ws_upstream_client_t *client);
+tcp_socket_t ws_upstream_fd(const ws_upstream_client_t *client);
 int ws_upstream_send_text(ws_upstream_client_t *client, const char *text);
 int ws_upstream_send_close(ws_upstream_client_t *client, uint16_t code);
 int ws_upstream_recv_frame(ws_upstream_client_t *client, uint8_t *opcode_out,

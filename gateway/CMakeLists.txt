@@ -32,6 +32,14 @@ target_link_libraries(
 	Threads::Threads
 )
 
+if (WIN32)
+	target_link_libraries(
+		gateway
+		PUBLIC
+		ws2_32
+	)
+endif()
+
 set_target_properties(
 	gateway
 	PROPERTIES

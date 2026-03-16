@@ -3,8 +3,8 @@
 這個 repo 現在保留四塊：
 
 - `wsh264/`: host 端 WebSocket H.264/audio source
-- `gateway/`: Linux host relay，接 `wsh264` upstream 並輸出解密後的 framed stream
-- `gateway_client/`: macOS/Linux host player，接 `gateway` downstream 並用 FFmpeg + SDL 播放
+- `gateway/`: host relay，接 `wsh264` upstream 並輸出解密後的 framed stream
+- `gateway_client/`: host player，接 `gateway` downstream 並用 FFmpeg + SDL 播放
 - AmebaPro firmware build 與 macOS 燒錄流程
 
 舊的 `httpd` / `tinyhttpd` / `genbin` / `htdocs` / `ministd` / `ws_server` 已移除。
@@ -17,20 +17,71 @@
 git submodule update --init --recursive
 ```
 
-如果要在 macOS 上 build 完整 host stack，先確認 `pkg-config` 能找到 `gateway_client` 需要的套件：
+## Build layout
+
+這個 repo 的 build 現在分成兩條：
+
+- host tools: `wsh264`、`gateway`、`gateway_client`，統一走根目錄 CMake
+- Ameba firmware: 走 SDK 內建 GNU Make，macOS 再由 wrapper script 幫忙處理
+
+Host build 不再靠不同 host 各自維護一套 Makefile，而是共用同一組
+`CMakeLists.txt`，再用少量 `WIN32` / `_WIN32` 分支處理平台差異。
+
+根目錄也提供了 [`CMakePresets.json`](/C:/Users/hkt99/work/carplay_poc/CMakePresets.json)，
+目前預留三個 host preset：
+
+- `linux-debug`
+- `macos-debug`
+- `windows-ucrt64`
+
+## Host build quick start
+
+macOS / Linux 先確認 `pkg-config` 能找到 `gateway_client` 需要的套件。
+
+macOS:
 
 ```bash
 brew install pkg-config sdl2 ffmpeg libusb
 ```
 
-整套 host binaries clean rebuild：
+Linux:
 
 ```bash
-cmake -S . -B build_clean
-cmake --build build_clean --target wsh264
-cmake --build build_clean --target gateway
-cmake --build build_clean --target gateway_client
+sudo apt install pkg-config libsdl2-dev libavcodec-dev libavutil-dev libswscale-dev libusb-1.0-0-dev ninja-build cmake
 ```
+
+整套 host binaries 用 preset 建置：
+
+macOS:
+
+```bash
+cmake --preset macos-debug
+cmake --build --preset macos-debug
+```
+
+Linux:
+
+```bash
+cmake --preset linux-debug
+cmake --build --preset linux-debug
+```
+
+如果只想編單一 target：
+
+```bash
+cmake --build --preset macos-debug --target wsh264
+cmake --build --preset macos-debug --target gateway
+cmake --build --preset macos-debug --target gateway_client
+```
+
+執行檔會放在 `build/<preset>/...`，例如：
+
+- `build/macos-debug/wsh264/wsh264`
+- `build/macos-debug/bin/gateway`
+- `build/macos-debug/bin/gateway_client`
+- `build/windows-ucrt64/wsh264/wsh264.exe`
+- `build/windows-ucrt64/bin/gateway.exe`
+- `build/windows-ucrt64/bin/gateway_client.exe`
 
 ## Windows host build
 
@@ -55,26 +106,25 @@ pacman -S --needed \
 
 ```bash
 git submodule update --init --recursive
-cmake -S . -B build-ucrt64 -G Ninja
-cmake --build build-ucrt64 --target wsh264
-cmake --build build-ucrt64 --target gateway_client
+cmake --preset windows-ucrt64
+cmake --build --preset windows-ucrt64
 ```
 
 目前已驗證可在 Windows 上建置的 target：
 
 - `wsh264`
+- `gateway`
 - `gateway_client`
-
-`gateway` 仍是偏 Linux/POSIX 的 relay，目前不在 Windows 支援範圍內。
 
 如果要從一般 PowerShell 或 `cmd.exe` 直接執行，而不是從 `MSYS2 UCRT64` shell
 內啟動，請把對應 DLL 一起放在執行檔旁，或把 `C:\msys64\ucrt64\bin` 加進
 `PATH`。
 
-目前 repo 內已整理一份可直接執行的 Windows 輸出到：
+Windows build 預設輸出目錄是：
 
-- `dist/windows-ucrt64/wsh264.exe`
-- `dist/windows-ucrt64/gateway_client.exe`
+- `build/windows-ucrt64/wsh264/wsh264.exe`
+- `build/windows-ucrt64/bin/gateway.exe`
+- `build/windows-ucrt64/bin/gateway_client.exe`
 
 如果要在 Windows 上使用 `gateway_client --transport usb`，除了 build 時安裝
 `libusb` 套件，還要確認目標 USB 裝置已綁定到 `WinUSB` 或其他 `libusb`
@@ -87,18 +137,13 @@ cmake --build build-ucrt64 --target gateway_client
 建置：
 
 ```bash
-cmake -S . -B build
-cmake --build build --target wsh264
+cmake --build --preset macos-debug --target wsh264
 ```
 
-clean rebuild：
+如果你目前不是用 `macos-debug`，把上面的 preset 名稱換成 `linux-debug` 或
+`windows-ucrt64` 即可。
 
-```bash
-cmake -S . -B build_clean
-cmake --build build_clean --target wsh264
-```
-
-也可以獨立建 `wsh264` 子專案：
+也可以獨立建 `wsh264` 子專案，不經過根目錄 preset：
 
 ```bash
 cmake -S wsh264 -B wsh264/build
@@ -108,7 +153,7 @@ cmake --build wsh264/build --target wsh264
 執行：
 
 ```bash
-./build/wsh264/wsh264 wsh264/test_data/iphone_baseline.h264
+./build/macos-debug/wsh264/wsh264 wsh264/test_data/iphone_baseline.h264
 ```
 
 注意：
@@ -119,19 +164,18 @@ cmake --build wsh264/build --target wsh264
 
 ## `gateway`
 
-`gateway` 是 Linux host relay，預設 listen `19000`，並連到 `wsh264` 的 `127.0.0.1:8081` upstream。
+`gateway` 是 host relay，預設 listen `19000`，並連到 `wsh264` 的 `127.0.0.1:8081` upstream。
 
 建置：
 
 ```bash
-cmake -S . -B build
-cmake --build build --target gateway
+cmake --build --preset macos-debug --target gateway
 ```
 
 執行：
 
 ```bash
-./build/bin/gateway --listen-port 19000 --upstream-host 127.0.0.1 --upstream-port 8081
+./build/macos-debug/bin/gateway --listen-port 19000 --upstream-host 127.0.0.1 --upstream-port 8081
 ```
 
 ## `gateway_client`
@@ -144,20 +188,19 @@ cmake --build build --target gateway
 建置：
 
 ```bash
-cmake -S . -B build
-cmake --build build --target gateway_client
+cmake --build --preset macos-debug --target gateway_client
 ```
 
 執行：
 
 ```bash
-./build/bin/gateway_client --transport tcp --host 127.0.0.1 --port 19000
+./build/macos-debug/bin/gateway_client --transport tcp --host 127.0.0.1 --port 19000
 ```
 
 或 USB：
 
 ```bash
-./build/bin/gateway_client --transport usb --usb-vid 0x0BDA --usb-pid 0x8195
+./build/macos-debug/bin/gateway_client --transport usb --usb-vid 0x0BDA --usb-pid 0x8195
 ```
 
 `gateway_client` 需要 `pkg-config` 可以找到：
