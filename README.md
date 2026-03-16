@@ -22,13 +22,13 @@ git submodule update --init --recursive
 
 ## Ameba SDK 檔案整理
 
-- AmebaPro SDK 壓縮檔放在 repo root：`sdk-ameba-v5.2g_gcc.tar.gz`
+- AmebaPro SDK 壓縮檔放在 `tools/`：`tools/sdk-ameba-v5.2g_gcc.tar.gz`
 - 只有 gateway 的 Ameba firmware build 需要這份 SDK
 - 本機開發前先解壓到 `./.local`
 
 ```bash
 mkdir -p ./.local
-tar -xzf sdk-ameba-v5.2g_gcc.tar.gz -C ./.local
+tar -xzf tools/sdk-ameba-v5.2g_gcc.tar.gz -C ./.local
 ```
 
 - 解壓後 SDK 根目錄應為 `./.local/sdk-ameba-v5.2g_gcc/`
