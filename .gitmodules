@@ -1,3 +1,3 @@
-[submodule "ws_server/third_party/chacha"]
-	path = ws_server/third_party/chacha
+[submodule "3rd_party/chacha"]
+	path = 3rd_party/chacha
 	url = git@github.com-work:hkt999rtk/chacha.git

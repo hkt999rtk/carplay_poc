@@ -1,79 +1,49 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This repository keeps only:
+
+- `wsh264/` and the minimal websocket/crypto support it needs
+- `3rd_party/chacha` shared third-party dependency
+- AmebaPro firmware build scripts and burn tooling
+
+Legacy `tinyhttpd`, `genbin`, `htdocs`, `gateway`, `gateway_client`, `ministd`, and `ws_server` sources have been removed.
+
+## Init
+
+```bash
+git submodule update --init --recursive
+```
 
 ## Build Commands
 
-### Building the Project
+### Build `wsh264`
 ```bash
-cd build
-cmake ..
+cmake -S . -B build
+cmake --build build --target wsh264
+```
+
+### Build `wsh264` Standalone
+```bash
+cmake -S wsh264 -B wsh264/build
+cmake --build wsh264/build --target wsh264
+```
+
+### Build Ameba Firmware on Linux
+```bash
+cd ./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE
+make clean
 make
 ```
 
-### Clean Build
+### Build Ameba Firmware on macOS
 ```bash
-cd build
-rm -rf *
-cmake ..
-make
+./scripts/build_ameba_firmware.sh --macos-host-toolchain
 ```
-
-### Building WebSocket Server (ws_server)
-```bash
-cd ws_server/build
-cmake ..
-make
-```
-
-## Project Architecture
-
-### Core Components
-
-**tinyhttpd** - A minimal HTTP server library designed for modularity and performance
-- Core implementation: `minihttpd.cpp` / `minihttpd.h`
-- Multi-threaded capability for better performance
-- Custom STL-like implementations in `ministd/` (string, vector, map, etc.)
-- Designed to work with nginx as a service module
-
-**genbin** - Static resource generator
-- Embeds web assets from `htdocs/` into binary format
-- Generates `htdocs_bin.c` with xxd for embedded systems
-- Handles MIME type detection and compression (gzip for text files)
-
-**ws_server** - WebSocket server with video streaming capabilities
-- Separate CMake project with OpenCV dependency
-- Includes H.264 video streaming (`wsh264/`)
-- JSON processing with cJSON
-- Base64, SHA1, UTF8 utilities for WebSocket protocol
-- Vendored directly in this repository; no submodule setup is required
-
-### Web Interface
-
-The `htdocs/` directory is now just a leftover minimal browser viewer asset set:
-- `main.html` is the single entry page
-- JavaScript is trimmed to websocket connect, ChaCha20 decrypt, H.264 decode/display, and PCM audio playback
-- The old `ameba/` HTTP server integration path has been removed
-
-### Cross-Platform Build System
-
-- **Native builds**: Uses system GCC/G++ (macOS, Linux)
-- **ARM embedded**: Configurable ARM toolchain support for embedded targets
-- **Build modes**: Debug (-Og -g) and Release (-Os -flto) configurations
-- **Custom commands**: Resource generation via `genbin`; active runtime build flow lives under `ws_server/`
-
-### Custom Standard Library (ministd)
-
-Custom implementations to avoid standard library dependencies:
-- `mystring.hpp` - String class with manual memory management
-- `myvector.hpp` - Dynamic array container
-- `mymap.hpp` - Key-value mapping using AVL tree (`avl_bf.c`)
-- `mylist.hpp` - Linked list implementation
-- Designed for embedded systems with minimal overhead
 
 ## Key Development Notes
 
-- The project supports both native development and ARM embedded targets
-- The actively maintained runtime path is `wsh264` + `gateway` + `gateway_client` plus the AmebaPro SDK firmware build under `./.local/sdk-ameba-v5.2g_gcc/`
-- Security warnings about `sprintf` usage exist - consider replacing with `snprintf`
-- WebSocket server requires OpenCV for video processing features
+- The actively maintained host binary is `wsh264`
+- `wsh264` derives `sound.raw` from the input H.264 path, so it no longer depends on a fixed working directory
+- macOS host builds must use host compiler binaries from macOS but target runtime libraries from the SDK
+- Docker is required on macOS for `elf2bin.linux` and `checksum.linux`
+- CrossOver is the current path for running the Windows image downloader on macOS
