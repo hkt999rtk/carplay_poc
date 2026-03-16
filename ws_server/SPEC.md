@@ -10,7 +10,7 @@
 - Protect websocket binary media payloads with ChaCha20.
 - Keep JSON command/event traffic plaintext.
 - Prefer minimum latency over AV sync.
-- Keep `gateway -> client` protocol transport-agnostic so TCP can later be replaced by libusb without changing the media framing.
+- Keep `gateway -> client` protocol transport-agnostic so the host client can switch between libusb and TCP without changing the media framing.
 
 ## Upstream WebSocket Protocol
 
@@ -53,8 +53,8 @@
 
 ### Transport model
 - The relay protocol is defined over a reliable byte stream.
-- v1 transport is TCP.
-- Future libusb support must reuse the same packet format.
+- The primary host transport is USB vendor bulk consumed with `libusb`.
+- TCP remains a host-only fallback for regression/debug flows and must use the exact same packet format.
 
 ### Init packet
 - One `GWI1` init packet is sent after the downstream transport is established:
@@ -90,10 +90,10 @@
 
 ## Lifecycle
 - `gateway` starts in listen mode.
-- The first downstream client connection triggers the upstream websocket connection to `wsh264`.
+- The first downstream client attachment triggers the upstream websocket connection to `wsh264`.
 - `gateway` sends `start_stream` and `start_audio_stream` upstream.
 - `gateway` rejects a second downstream client while one session is active.
-- When the downstream client disconnects:
+- When the downstream client disconnects or the USB host detaches:
   - `gateway` sends `stop_stream` and `stop_audio_stream`
   - closes the upstream websocket session
   - returns to listen mode

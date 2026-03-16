@@ -17,7 +17,7 @@ extern "C" {
 #include <SDL2/SDL.h>
 
 #include "gateway_proto.h"
-#include "tcp_transport.h"
+#include "transport.h"
 }
 
 struct SharedVideoPacket {
@@ -31,7 +31,7 @@ struct SharedVideoPacket {
 };
 
 struct PlaybackState {
-	int fd = -1;
+	gateway_client_transport_t transport{};
 	SDL_AudioDeviceID audio_dev = 0;
 	std::atomic<bool> running{true};
 	SharedVideoPacket latest_video;
@@ -227,13 +227,42 @@ static uint8_t h264_nal_type(const std::vector<uint8_t> &payload)
 	return (uint8_t)(payload[0] & 0x1f);
 }
 
+static bool parse_u16_arg(const char *text, uint16_t &out)
+{
+	char *end = nullptr;
+	unsigned long value;
+
+	if (text == nullptr || *text == '\0')
+		return false;
+	value = strtoul(text, &end, 0);
+	if (end == nullptr || *end != '\0' || value > 0xfffful)
+		return false;
+	out = (uint16_t)value;
+	return true;
+}
+
+static bool parse_int_arg(const char *text, int &out)
+{
+	char *end = nullptr;
+	long value;
+
+	if (text == nullptr || *text == '\0')
+		return false;
+	value = strtol(text, &end, 0);
+	if (end == nullptr || *end != '\0')
+		return false;
+	out = (int)value;
+	return true;
+}
+
 static void network_reader(PlaybackState *state)
 {
 	while (state->running.load()) {
 		uint8_t header_buf[GATEWAY_PROTO_PACKET_HEADER_SIZE];
 		gateway_proto_media_info_t media_info;
 		std::vector<uint8_t> payload;
-		int rc = tcp_transport_read_exact(state->fd, header_buf, sizeof(header_buf));
+		int rc = gateway_client_transport_read_exact(&state->transport, header_buf,
+							     sizeof(header_buf));
 		if (rc <= 0)
 			break;
 		if (gateway_proto_read_media_header(&media_info, header_buf) != 0)
@@ -241,39 +270,40 @@ static void network_reader(PlaybackState *state)
 
 		payload.resize(media_info.payload_len);
 		if (media_info.payload_len > 0 &&
-		    tcp_transport_read_exact(state->fd, payload.data(), payload.size()) <= 0)
+		    gateway_client_transport_read_exact(&state->transport, payload.data(),
+							payload.size()) <= 0)
 			break;
 
-			if (media_info.stream_id == GATEWAY_PROTO_STREAM_VIDEO) {
-				std::lock_guard<std::mutex> guard(state->latest_video.lock);
-				uint8_t nal_type = h264_nal_type(payload);
-				if ((media_info.flags & GATEWAY_PROTO_FLAG_CONFIG) != 0) {
-					if (nal_type == 7)
-						state->latest_video.sps = payload;
-					else if (nal_type == 8)
-						state->latest_video.pps = payload;
-				} else {
-					std::vector<uint8_t> packet;
-					bool keyframe = (media_info.flags & GATEWAY_PROTO_FLAG_KEYFRAME) != 0;
+		if (media_info.stream_id == GATEWAY_PROTO_STREAM_VIDEO) {
+			std::lock_guard<std::mutex> guard(state->latest_video.lock);
+			uint8_t nal_type = h264_nal_type(payload);
+			if ((media_info.flags & GATEWAY_PROTO_FLAG_CONFIG) != 0) {
+				if (nal_type == 7)
+					state->latest_video.sps = payload;
+				else if (nal_type == 8)
+					state->latest_video.pps = payload;
+			} else {
+				std::vector<uint8_t> packet;
+				bool keyframe = (media_info.flags & GATEWAY_PROTO_FLAG_KEYFRAME) != 0;
 
-					if (keyframe) {
-						annexb_append(packet, state->latest_video.sps);
-						annexb_append(packet, state->latest_video.pps);
-					}
-					annexb_append(packet, payload);
-
-					if (state->latest_video.ready &&
-					    state->latest_video.keyframe &&
-					    !keyframe) {
-						continue;
-					}
-
-					state->latest_video.packet.swap(packet);
-					state->latest_video.seq_no = media_info.seq_no;
-					state->latest_video.keyframe = keyframe;
-					state->latest_video.ready = true;
+				if (keyframe) {
+					annexb_append(packet, state->latest_video.sps);
+					annexb_append(packet, state->latest_video.pps);
 				}
-			} else if (media_info.stream_id == GATEWAY_PROTO_STREAM_AUDIO) {
+				annexb_append(packet, payload);
+
+				if (state->latest_video.ready &&
+				    state->latest_video.keyframe &&
+				    !keyframe) {
+					continue;
+				}
+
+				state->latest_video.packet.swap(packet);
+				state->latest_video.seq_no = media_info.seq_no;
+				state->latest_video.keyframe = keyframe;
+				state->latest_video.ready = true;
+			}
+		} else if (media_info.stream_id == GATEWAY_PROTO_STREAM_AUDIO) {
 			if (state->audio_dev != 0) {
 				if (SDL_GetQueuedAudioSize(state->audio_dev) > state->audio_drop_threshold)
 					SDL_ClearQueuedAudio(state->audio_dev);
@@ -283,13 +313,11 @@ static void network_reader(PlaybackState *state)
 	}
 
 	state->running.store(false);
-	tcp_transport_shutdown_close(state->fd);
+	gateway_client_transport_request_stop(&state->transport);
 }
 
 int main(int argc, char **argv)
 {
-	const char *host = "127.0.0.1";
-	uint16_t port = 19000u;
 	gateway_proto_init_info_t init_info;
 	uint8_t init_buf[GATEWAY_PROTO_INIT_SIZE];
 	PlaybackState state;
@@ -297,34 +325,83 @@ int main(int argc, char **argv)
 	SDL_AudioSpec desired;
 	SDL_AudioSpec obtained;
 	std::thread reader_thread;
+	gateway_client_transport_options_t transport_options;
+
+	gateway_client_transport_options_default(&transport_options);
 
 	for (int i = 1; i < argc; ++i) {
-		if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
-			host = argv[++i];
+		if (strcmp(argv[i], "--transport") == 0 && i + 1 < argc) {
+			const char *value = argv[++i];
+			if (strcmp(value, "usb") == 0)
+				transport_options.kind = GATEWAY_CLIENT_TRANSPORT_USB;
+			else if (strcmp(value, "tcp") == 0)
+				transport_options.kind = GATEWAY_CLIENT_TRANSPORT_TCP;
+			else {
+				fprintf(stderr, "gateway_client: unsupported transport '%s'\n", value);
+				return 2;
+			}
+		} else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+			transport_options.host = argv[++i];
 		} else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-			port = (uint16_t)strtoul(argv[++i], nullptr, 10);
+			if (!parse_u16_arg(argv[++i], transport_options.port)) {
+				fprintf(stderr, "gateway_client: invalid port\n");
+				return 2;
+			}
+		} else if (strcmp(argv[i], "--usb-vid") == 0 && i + 1 < argc) {
+			if (!parse_u16_arg(argv[++i], transport_options.usb_vid)) {
+				fprintf(stderr, "gateway_client: invalid usb vid\n");
+				return 2;
+			}
+		} else if (strcmp(argv[i], "--usb-pid") == 0 && i + 1 < argc) {
+			if (!parse_u16_arg(argv[++i], transport_options.usb_pid)) {
+				fprintf(stderr, "gateway_client: invalid usb pid\n");
+				return 2;
+			}
+		} else if (strcmp(argv[i], "--usb-poll-ms") == 0 && i + 1 < argc) {
+			if (!parse_int_arg(argv[++i], transport_options.usb_poll_ms) ||
+			    transport_options.usb_poll_ms <= 0) {
+				fprintf(stderr, "gateway_client: invalid usb poll interval\n");
+				return 2;
+			}
+		} else if (strcmp(argv[i], "--usb-timeout-ms") == 0 && i + 1 < argc) {
+			if (!parse_int_arg(argv[++i], transport_options.usb_transfer_timeout_ms) ||
+			    transport_options.usb_transfer_timeout_ms <= 0) {
+				fprintf(stderr, "gateway_client: invalid usb transfer timeout\n");
+				return 2;
+			}
 		} else {
-			fprintf(stderr, "usage: %s [--host HOST] [--port N]\n", argv[0]);
+			fprintf(stderr,
+				"usage: %s [--transport usb|tcp] [--host HOST] [--port N] "
+				"[--usb-vid VID] [--usb-pid PID] [--usb-poll-ms N] "
+				"[--usb-timeout-ms N]\n",
+				argv[0]);
 			return 2;
 		}
 	}
 
-	state.fd = tcp_transport_connect(host, port);
-	if (state.fd < 0) {
-		perror("gateway_client connect");
+	if (transport_options.kind == GATEWAY_CLIENT_TRANSPORT_TCP) {
+		fprintf(stderr, "gateway_client: connecting via TCP to %s:%u\n",
+			transport_options.host, (unsigned)transport_options.port);
+	} else {
+		fprintf(stderr, "gateway_client: opening USB transport %04x:%04x\n",
+			(unsigned)transport_options.usb_vid, (unsigned)transport_options.usb_pid);
+	}
+
+	if (gateway_client_transport_open(&state.transport, &transport_options) != 0) {
+		fprintf(stderr, "gateway_client: transport open failed\n");
 		return 1;
 	}
 
-	if (tcp_transport_read_exact(state.fd, init_buf, sizeof(init_buf)) <= 0 ||
+	if (gateway_client_transport_read_exact(&state.transport, init_buf, sizeof(init_buf)) <= 0 ||
 	    gateway_proto_read_init(&init_info, init_buf) != 0) {
 		fprintf(stderr, "gateway_client: failed to read init packet\n");
-		tcp_transport_shutdown_close(state.fd);
+		gateway_client_transport_close(&state.transport);
 		return 1;
 	}
 
 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
 		fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-		tcp_transport_shutdown_close(state.fd);
+		gateway_client_transport_close(&state.transport);
 		return 1;
 	}
 
@@ -340,7 +417,7 @@ int main(int argc, char **argv)
 
 	if (!decoder_init(decoder)) {
 		fprintf(stderr, "gateway_client: decoder init failed\n");
-		tcp_transport_shutdown_close(state.fd);
+		gateway_client_transport_close(&state.transport);
 		if (state.audio_dev != 0)
 			SDL_CloseAudioDevice(state.audio_dev);
 		SDL_Quit();
@@ -354,8 +431,10 @@ int main(int argc, char **argv)
 		bool keyframe = false;
 
 		while (SDL_PollEvent(&event)) {
-			if (event.type == SDL_QUIT)
+			if (event.type == SDL_QUIT) {
 				state.running.store(false);
+				gateway_client_transport_request_stop(&state.transport);
+			}
 		}
 
 		{
@@ -382,9 +461,10 @@ int main(int argc, char **argv)
 		}
 	}
 
-	tcp_transport_shutdown_close(state.fd);
+	gateway_client_transport_request_stop(&state.transport);
 	if (reader_thread.joinable())
 		reader_thread.join();
+	gateway_client_transport_close(&state.transport);
 	if (state.audio_dev != 0)
 		SDL_CloseAudioDevice(state.audio_dev);
 	decoder_destroy(decoder);

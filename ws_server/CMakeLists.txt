@@ -10,6 +10,7 @@ pkg_check_modules(GATEWAY_CLIENT_DEPS REQUIRED
 	libavcodec
 	libavutil
 	libswscale
+	libusb-1.0
 )
 
 link_directories(${GATEWAY_CLIENT_DEPS_LIBRARY_DIRS})
@@ -109,6 +110,8 @@ target_link_libraries(
 add_executable(
 	gateway_client
 	${CMAKE_CURRENT_LIST_DIR}/gateway_client/gateway_client.cpp
+	${CMAKE_CURRENT_LIST_DIR}/gateway_client/transport.c
+	${CMAKE_CURRENT_LIST_DIR}/gateway_client/transport_libusb.c
 	${CMAKE_CURRENT_LIST_DIR}/gateway/tcp_transport.c
 )
 

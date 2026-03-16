@@ -20,6 +20,13 @@
 git submodule update --init --recursive
 ```
 
+## Ameba SDK 檔案整理
+
+- 可版本化的 SDK 壓縮檔放在 `third_party/archives/ameba/`
+- `.tar.gz` 由 Git LFS 管理
+- 本機解壓後的 SDK 目錄保留在 `ameba_pro1_sdk/sdk-ameba-v5.2g_gcc/`
+- 解壓目錄已加入 `.gitignore`，不直接進 Git
+
 ## Build
 
 ### HTTP server
@@ -44,6 +51,23 @@ make
 - `gateway`
 - `gateway_client`
 - `crypto_proto_tests`
+
+### Ameba gateway overlay
+
+```bash
+./ameba_pro1_sdk/overlay/build_gateway_ameba.sh clean
+./ameba_pro1_sdk/overlay/build_gateway_ameba.sh application
+```
+
+預設會使用 `/Applications/ARM/bin` 下的 cross-compiler；若你的 toolchain 在別處，可用 `ARM_GCC_TOOLCHAIN=/path/to/arm/bin` 覆寫。
+
+這個 overlay 目前的主線是：
+
+- upstream: Wi-Fi websocket 連到 `wsh264`
+- downstream: USB vendor bulk
+- relay protocol: 沿用 `GWI1/GWP1`
+
+若只是本機除錯，才建議把 Ameba overlay compile-time 切回 TCP downstream。
 
 ## 直接跑 browser
 
@@ -90,7 +114,15 @@ cd ws_server/build
 
 ```bash
 cd ws_server/build
-./gateway_client --host 127.0.0.1 --port 19000
+./gateway_client
+```
+
+`gateway_client` 現在預設會用 `libusb` 等待 Ameba USB vendor bulk device (`0x0BDA:0x8195`)，claim interface 後直接讀 `GWI1/GWP1` stream。
+
+如果只是要沿用 host-only 的舊 TCP relay 測試流程，可改用：
+
+```bash
+./gateway_client --transport tcp --host 127.0.0.1 --port 19000
 ```
 
 `gateway` 只有在下游 client 連上後才會連 `wsh264`。同一時間只接受一個下游 client，多餘連線會直接拒絕。
