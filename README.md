@@ -130,6 +130,39 @@ Windows build 預設輸出目錄是：
 `libusb` 套件，還要確認目標 USB 裝置已綁定到 `WinUSB` 或其他 `libusb`
 可用的 driver；否則 `libusb` 可能無法成功開啟裝置。
 
+## Demo flow
+
+這個 repo 目前驗證過的 host demo flow 是：
+
+1. `wsh264` 當 video/audio source，開 WebSocket upstream 在 `127.0.0.1:8081`
+2. `gateway` 連到 `wsh264`，把解密後的 framed stream 轉送到 `127.0.0.1:19000`
+3. `gateway_client` 用 `--transport tcp` 連到 `gateway`，解 H.264 並顯示畫面
+
+Windows 上建議直接照下面順序，在三個不同 terminal 視窗執行。
+
+先啟動 `wsh264`：
+
+```powershell
+$env:PATH = "C:\msys64\ucrt64\bin;" + $env:PATH
+.\build\windows-ucrt64\wsh264\wsh264.exe wsh264\test_data\iphone_baseline.h264
+```
+
+再啟動 `gateway`：
+
+```powershell
+$env:PATH = "C:\msys64\ucrt64\bin;" + $env:PATH
+.\build\windows-ucrt64\bin\gateway.exe --listen-port 19000 --upstream-host 127.0.0.1 --upstream-port 8081
+```
+
+最後啟動 `gateway_client`，這裡 demo 一律使用 TCP，不走 USB：
+
+```powershell
+$env:PATH = "C:\msys64\ucrt64\bin;" + $env:PATH
+.\build\windows-ucrt64\bin\gateway_client.exe --transport tcp --host 127.0.0.1 --port 19000
+```
+
+如果畫面正常顯示，代表整條 `wsh264 -> gateway -> gateway_client` video pipe 已經打通。
+
 ## `wsh264`
 
 `wsh264` 會啟動 WebSocket server，預設 port `8081`，並送出加密後的 video/audio stream。
