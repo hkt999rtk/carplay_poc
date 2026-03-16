@@ -5,3 +5,4 @@ ameba/htdocs_bin.c
 htdocs/version.txt
 htdocs/web_ver.html
 htdocs_video_only.zip
+.local/
