@@ -102,43 +102,12 @@ add_executable(
 	${CMAKE_CURRENT_LIST_DIR}/genbin/genbin.cpp
 )
 
-add_executable(
-	amebatest
-	${CMAKE_CURRENT_LIST_DIR}/ameba/httpd.cpp
-	${CMAKE_CURRENT_LIST_DIR}/ameba/freertos.c
-	${CMAKE_CURRENT_LIST_DIR}/ameba/example_httpd.c
-	${CMAKE_CURRENT_LIST_DIR}/ministd/avl_bf.c
-)
-
-target_include_directories(
-	amebatest
-	PUBLIC
-	${CMAKE_CURRENT_LIST_DIR}/ameba/sys_include
-	${CMAKE_CURRENT_LIST_DIR}
-)
-
-
-add_custom_command(
-	TARGET ${CMAKE_PROJECT_NAME} PRE_BUILD
-	COMMAND ${CMAKE_COMMAND} -E create_symlink
-	${CMAKE_SOURCE_DIR}/htdocs $<TARGET_FILE_DIR:${PROJECT_NAME}>/htdocs
-)
-
 add_custom_command(
 	TARGET genbin POST_BUILD
-	COMMAND genbin
-	COMMAND xxd -i htdocs.bin > htdocs_bin.c
-)
-
-add_custom_command(
-	TARGET genbin POST_BUILD
-	COMMAND ${CMAKE_COMMAND} -E copy
-	${CMAKE_CURRENT_BINARY_DIR}/*.c
-	${CMAKE_CURRENT_SOURCE_DIR}/ameba
-)
-
-target_link_libraries(
-	amebatest
-	PUBLIC
-	tinyhttpd
+	COMMAND ${CMAKE_CURRENT_BINARY_DIR}/genbin
+	COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/htdocs.bin ${CMAKE_CURRENT_BINARY_DIR}/htdocs.bin
+	COMMAND xxd -i ${CMAKE_CURRENT_SOURCE_DIR}/htdocs.bin > ${CMAKE_CURRENT_BINARY_DIR}/htdocs_bin.c
+	COMMAND ${CMAKE_COMMAND} -E rm -f ${CMAKE_CURRENT_SOURCE_DIR}/htdocs.bin
+	COMMAND ${CMAKE_COMMAND} -E rm -f ${CMAKE_CURRENT_SOURCE_DIR}/output.bin.gz
+	WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )

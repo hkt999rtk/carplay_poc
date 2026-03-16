@@ -41,11 +41,6 @@ make
 - Generates `htdocs_bin.c` with xxd for embedded systems
 - Handles MIME type detection and compression (gzip for text files)
 
-**amebatest** - Target application for Ameba embedded platform
-- Links against tinyhttpd library
-- Includes FreeRTOS integration (`ameba/freertos.c`)
-- Provides HTTP server functionality for embedded systems
-
 **ws_server** - WebSocket server with video streaming capabilities
 - Separate CMake project with OpenCV dependency
 - Includes H.264 video streaming (`wsh264/`)
@@ -55,17 +50,17 @@ make
 
 ### Web Interface
 
-The `htdocs/` directory now contains a minimal browser viewer only:
+The `htdocs/` directory is now just a leftover minimal browser viewer asset set:
 - `main.html` is the single entry page
 - JavaScript is trimmed to websocket connect, ChaCha20 decrypt, H.264 decode/display, and PCM audio playback
-- Extra demo pages and UI assets have been removed
+- The old `ameba/` HTTP server integration path has been removed
 
 ### Cross-Platform Build System
 
 - **Native builds**: Uses system GCC/G++ (macOS, Linux)
 - **ARM embedded**: Configurable ARM toolchain support for embedded targets
 - **Build modes**: Debug (-Og -g) and Release (-Os -flto) configurations
-- **Custom commands**: Automatic resource embedding and file copying
+- **Custom commands**: Resource generation via `genbin`; active runtime build flow lives under `ws_server/`
 
 ### Custom Standard Library (ministd)
 
@@ -79,7 +74,6 @@ Custom implementations to avoid standard library dependencies:
 ## Key Development Notes
 
 - The project supports both native development and ARM embedded targets
-- Web resources are automatically embedded into the binary during build
+- The actively maintained runtime path is `wsh264` + `gateway` + `gateway_client` plus the AmebaPro SDK firmware build under `./.local/sdk-ameba-v5.2g_gcc/`
 - Security warnings about `sprintf` usage exist - consider replacing with `snprintf`
-- The build system creates symlinks for development and copies files for embedded deployment
 - WebSocket server requires OpenCV for video processing features
