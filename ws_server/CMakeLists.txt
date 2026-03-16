@@ -3,17 +3,18 @@ cmake_minimum_required(VERSION 3.12)
 project(ws_server C CXX)
 
 find_package(Threads REQUIRED)
-find_package(PkgConfig REQUIRED)
 find_program(NODE_EXECUTABLE node)
-pkg_check_modules(GATEWAY_CLIENT_DEPS REQUIRED
-	sdl2
-	libavcodec
-	libavutil
-	libswscale
-	libusb-1.0
-)
+find_package(PkgConfig QUIET)
 
-link_directories(${GATEWAY_CLIENT_DEPS_LIBRARY_DIRS})
+if (PkgConfig_FOUND)
+	pkg_check_modules(GATEWAY_CLIENT_DEPS QUIET
+		sdl2
+		libavcodec
+		libavutil
+		libswscale
+		libusb-1.0
+	)
+endif()
 
 add_library(
 	chacha
@@ -107,41 +108,47 @@ target_link_libraries(
 	Threads::Threads
 )
 
-add_executable(
-	gateway_client
-	${CMAKE_CURRENT_LIST_DIR}/gateway_client/gateway_client.cpp
-	${CMAKE_CURRENT_LIST_DIR}/gateway_client/transport.c
-	${CMAKE_CURRENT_LIST_DIR}/gateway_client/transport_libusb.c
-	${CMAKE_CURRENT_LIST_DIR}/gateway/tcp_transport.c
-)
+if (PkgConfig_FOUND AND GATEWAY_CLIENT_DEPS_FOUND)
+	link_directories(${GATEWAY_CLIENT_DEPS_LIBRARY_DIRS})
 
-target_include_directories(
-	gateway_client
-	PUBLIC
-	${CMAKE_CURRENT_LIST_DIR}/include
-	${CMAKE_CURRENT_LIST_DIR}/gateway
-	${GATEWAY_CLIENT_DEPS_INCLUDE_DIRS}
-)
+	add_executable(
+		gateway_client
+		${CMAKE_CURRENT_LIST_DIR}/gateway_client/gateway_client.cpp
+		${CMAKE_CURRENT_LIST_DIR}/gateway_client/transport.c
+		${CMAKE_CURRENT_LIST_DIR}/gateway_client/transport_libusb.c
+		${CMAKE_CURRENT_LIST_DIR}/gateway/tcp_transport.c
+	)
 
-target_link_directories(
-	gateway_client
-	PUBLIC
-	${GATEWAY_CLIENT_DEPS_LIBRARY_DIRS}
-)
+	target_include_directories(
+		gateway_client
+		PUBLIC
+		${CMAKE_CURRENT_LIST_DIR}/include
+		${CMAKE_CURRENT_LIST_DIR}/gateway
+		${GATEWAY_CLIENT_DEPS_INCLUDE_DIRS}
+	)
 
-target_compile_options(
-	gateway_client
-	PUBLIC
-	${GATEWAY_CLIENT_DEPS_CFLAGS_OTHER}
-)
+	target_link_directories(
+		gateway_client
+		PUBLIC
+		${GATEWAY_CLIENT_DEPS_LIBRARY_DIRS}
+	)
 
-target_link_libraries(
-	gateway_client
-	PUBLIC
-	ws_stream_common
-	Threads::Threads
-	${GATEWAY_CLIENT_DEPS_LIBRARIES}
-)
+	target_compile_options(
+		gateway_client
+		PUBLIC
+		${GATEWAY_CLIENT_DEPS_CFLAGS_OTHER}
+	)
+
+	target_link_libraries(
+		gateway_client
+		PUBLIC
+		ws_stream_common
+		Threads::Threads
+		${GATEWAY_CLIENT_DEPS_LIBRARIES}
+	)
+else()
+	message(STATUS "gateway_client disabled: missing pkg-config or SDL2/libav/libusb modules")
+endif()
 
 add_executable(
 	crypto_proto_tests

@@ -10,7 +10,7 @@
 - `gateway`: 收到下游 client 後，才向 `wsh264` 建立 upstream websocket 連線，解密後轉成 framed byte stream
 - `gateway_client`: 連到 `gateway`，在 host 上直接播放 H.264 video 與 PCM audio
 
-完整協議與設計說明在 [ws_server/SPEC.md](/Users/kevinhuang/work/carplay_poc/ws_server/SPEC.md)。
+完整協議與設計說明在 [ws_server/SPEC.md](ws_server/SPEC.md)。
 
 ## 初始化
 
@@ -22,10 +22,17 @@ git submodule update --init --recursive
 
 ## Ameba SDK 檔案整理
 
-- 可版本化的 SDK 壓縮檔放在 `third_party/archives/ameba/`
-- `.tar.gz` 由 Git LFS 管理
-- 本機解壓後的 SDK 目錄保留在 `ameba_pro1_sdk/sdk-ameba-v5.2g_gcc/`
-- 解壓目錄已加入 `.gitignore`，不直接進 Git
+- AmebaPro SDK 壓縮檔放在 repo root：`sdk-ameba-v5.2g_gcc.tar.gz`
+- 只有 gateway 的 Ameba firmware build 需要這份 SDK
+- 本機開發前先解壓到 `./.local`
+
+```bash
+mkdir -p ./.local
+tar -xzf sdk-ameba-v5.2g_gcc.tar.gz -C ./.local
+```
+
+- 解壓後 SDK 根目錄應為 `./.local/sdk-ameba-v5.2g_gcc/`
+- `./.local/` 已加入 `.gitignore`，不直接進 Git
 
 ## Build
 
@@ -45,29 +52,45 @@ cmake ..
 make
 ```
 
-這會編出：
-
 - `wsh264`
 - `gateway`
 - `gateway_client`
 - `crypto_proto_tests`
 
-### Ameba gateway overlay
+如果是 Linux host，且你只需要 relay，不需要本機播放端，才可以改成只 build `gateway`：
 
 ```bash
-./ameba_pro1_sdk/overlay/build_gateway_ameba.sh clean
-./ameba_pro1_sdk/overlay/build_gateway_ameba.sh application
+cd ws_server/build
+cmake ..
+make gateway
 ```
 
-預設會使用 `/Applications/ARM/bin` 下的 cross-compiler；若你的 toolchain 在別處，可用 `ARM_GCC_TOOLCHAIN=/path/to/arm/bin` 覆寫。
+這個 `gateway-only` 流程只適用於 Linux host relay build；不代表所有平台或所有開發流程都可以跳過 `gateway_client`。
 
-這個 overlay 目前的主線是：
+### Ameba firmware build
+
+```bash
+cd ./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE
+make clean
+make
+```
+
+這個 firmware build 才依賴 AmebaPro SDK。第一次編譯時會由 SDK Makefile 自動把 bundled Arm GCC 展開到 `./.local/sdk-ameba-v5.2g_gcc/tools/arm-none-eabi-gcc/asdk/linux/`。
+
+要產生可直接燒錄的完整 image，這裡要用 `make`，因為 SDK 會先 build `ram_lp`，再 build `ram_is`；單跑 `make ram_is` 不會先產生 `application_lp/Debug/bin/application_lp.axf`，最後 image packaging 會不完整。
+
+主要輸出檔：
+
+- `./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE/application_is/flash_is.bin`
+- `./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE/application_is/firmware_is.bin`
+
+gateway/Ameba 端目前的主線是：
 
 - upstream: Wi-Fi websocket 連到 `wsh264`
 - downstream: USB vendor bulk
 - relay protocol: 沿用 `GWI1/GWP1`
 
-若只是本機除錯，才建議把 Ameba overlay compile-time 切回 TCP downstream。
+若只是本機除錯，才建議把 Ameba compile-time 切回 TCP downstream。
 
 ## 直接跑 browser
 
