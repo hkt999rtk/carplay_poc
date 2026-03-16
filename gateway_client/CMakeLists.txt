@@ -59,6 +59,14 @@ if (PkgConfig_FOUND AND GATEWAY_CLIENT_DEPS_FOUND)
 		${GATEWAY_CLIENT_DEPS_LIBRARIES}
 	)
 
+	if (WIN32)
+		target_link_libraries(
+			gateway_client
+			PUBLIC
+			ws2_32
+		)
+	endif()
+
 	set_target_properties(
 		gateway_client
 		PROPERTIES

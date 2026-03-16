@@ -34,7 +34,7 @@ int gateway_client_transport_open(gateway_client_transport_t *transport,
 
 	memset(transport, 0, sizeof(*transport));
 	transport->kind = options->kind;
-	transport->tcp_fd = -1;
+	transport->tcp_fd = TCP_TRANSPORT_INVALID_SOCKET;
 	transport->usb_interface_number = -1;
 	transport->usb_vid = options->usb_vid;
 	transport->usb_pid = options->usb_pid;
@@ -44,7 +44,7 @@ int gateway_client_transport_open(gateway_client_transport_t *transport,
 		return gateway_client_transport_usb_open(transport, options);
 
 	transport->tcp_fd = tcp_transport_connect(options->host, options->port);
-	return transport->tcp_fd >= 0 ? 0 : -1;
+	return transport->tcp_fd != TCP_TRANSPORT_INVALID_SOCKET ? 0 : -1;
 }
 
 int gateway_client_transport_read_exact(gateway_client_transport_t *transport, void *buf, size_t len)
@@ -67,9 +67,9 @@ void gateway_client_transport_request_stop(gateway_client_transport_t *transport
 		return;
 	}
 
-	if (transport->tcp_fd >= 0) {
+	if (transport->tcp_fd != TCP_TRANSPORT_INVALID_SOCKET) {
 		tcp_transport_shutdown_close(transport->tcp_fd);
-		transport->tcp_fd = -1;
+		transport->tcp_fd = TCP_TRANSPORT_INVALID_SOCKET;
 	}
 }
 
@@ -83,9 +83,9 @@ void gateway_client_transport_close(gateway_client_transport_t *transport)
 		return;
 	}
 
-	if (transport->tcp_fd >= 0) {
+	if (transport->tcp_fd != TCP_TRANSPORT_INVALID_SOCKET) {
 		tcp_transport_shutdown_close(transport->tcp_fd);
-		transport->tcp_fd = -1;
+		transport->tcp_fd = TCP_TRANSPORT_INVALID_SOCKET;
 	}
 }
 

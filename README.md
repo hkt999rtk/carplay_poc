@@ -32,6 +32,54 @@ cmake --build build_clean --target gateway
 cmake --build build_clean --target gateway_client
 ```
 
+## Windows host build
+
+Windows 目前建議走 `MSYS2 UCRT64`，不要直接用原生 MSVC。這樣可以沿用
+`pkg-config`、FFmpeg、SDL2、`libusb` 與大部分 POSIX 相容層。
+
+先安裝 [MSYS2](https://www.msys2.org/)，然後開 `MSYS2 UCRT64` shell 更新並安裝套件：
+
+```bash
+pacman -Suy
+pacman -S --needed \
+  mingw-w64-ucrt-x86_64-toolchain \
+  mingw-w64-ucrt-x86_64-cmake \
+  mingw-w64-ucrt-x86_64-ninja \
+  mingw-w64-ucrt-x86_64-pkgconf \
+  mingw-w64-ucrt-x86_64-SDL2 \
+  mingw-w64-ucrt-x86_64-ffmpeg \
+  mingw-w64-ucrt-x86_64-libusb
+```
+
+在 `MSYS2 UCRT64` shell 內建置：
+
+```bash
+git submodule update --init --recursive
+cmake -S . -B build-ucrt64 -G Ninja
+cmake --build build-ucrt64 --target wsh264
+cmake --build build-ucrt64 --target gateway_client
+```
+
+目前已驗證可在 Windows 上建置的 target：
+
+- `wsh264`
+- `gateway_client`
+
+`gateway` 仍是偏 Linux/POSIX 的 relay，目前不在 Windows 支援範圍內。
+
+如果要從一般 PowerShell 或 `cmd.exe` 直接執行，而不是從 `MSYS2 UCRT64` shell
+內啟動，請把對應 DLL 一起放在執行檔旁，或把 `C:\msys64\ucrt64\bin` 加進
+`PATH`。
+
+目前 repo 內已整理一份可直接執行的 Windows 輸出到：
+
+- `dist/windows-ucrt64/wsh264.exe`
+- `dist/windows-ucrt64/gateway_client.exe`
+
+如果要在 Windows 上使用 `gateway_client --transport usb`，除了 build 時安裝
+`libusb` 套件，還要確認目標 USB 裝置已綁定到 `WinUSB` 或其他 `libusb`
+可用的 driver；否則 `libusb` 可能無法成功開啟裝置。
+
 ## `wsh264`
 
 `wsh264` 會啟動 WebSocket server，預設 port `8081`，並送出加密後的 video/audio stream。

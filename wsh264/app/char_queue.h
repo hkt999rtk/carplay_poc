@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdlib.h>
+#include <stdint.h>
 
 #define SZ_QUEUE	65535
 typedef struct char_queue_s {

@@ -1569,8 +1569,16 @@ static void *ws_accept(void *data)
 			 * See:
 			 *   https://linux.die.net/man/3/setsockopt
 			 */
+#ifndef _WIN32
 			setsockopt(new_sock, SOL_SOCKET, SO_SNDTIMEO, &time,
 				sizeof(struct timeval));
+#else
+			{
+				DWORD timeout_ms = (DWORD)timeout;
+				setsockopt(new_sock, SOL_SOCKET, SO_SNDTIMEO,
+					(const char *)&timeout_ms, sizeof(timeout_ms));
+			}
+#endif
 		}
 
 		if (new_sock < 0)

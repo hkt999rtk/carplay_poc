@@ -1,6 +1,7 @@
 *.o
 build
 build_*/
+dist/windows-ucrt64/
 .DS_Store
 .local/
 setting.xml

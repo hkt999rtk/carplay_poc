@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "tcp_transport.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,7 +27,7 @@ typedef struct gateway_client_transport_options {
 typedef struct gateway_client_transport {
 	gateway_client_transport_kind_t kind;
 	volatile int stop_requested;
-	int tcp_fd;
+	tcp_socket_t tcp_fd;
 	void *usb_ctx;
 	void *usb_handle;
 	int usb_interface_number;

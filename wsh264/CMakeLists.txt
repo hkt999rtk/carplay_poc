@@ -32,6 +32,14 @@ target_include_directories(
 	${CMAKE_CURRENT_LIST_DIR}/include
 )
 
+if (WIN32)
+	target_link_libraries(
+		wsh264_ws
+		PUBLIC
+		ws2_32
+	)
+endif()
+
 add_library(
 	wsh264_crypto
 	${CMAKE_CURRENT_LIST_DIR}/src/crypto_stream.c
