@@ -1,12 +1,13 @@
 # carplay_poc
 
-這個 repo 現在保留三塊：
+這個 repo 現在保留四塊：
 
 - `wsh264/`: host 端 WebSocket H.264/audio source
 - `gateway/`: Linux host relay，接 `wsh264` upstream 並輸出解密後的 framed stream
+- `gateway_client/`: macOS/Linux host player，接 `gateway` downstream 並用 FFmpeg + SDL 播放
 - AmebaPro firmware build 與 macOS 燒錄流程
 
-舊的 `httpd` / `tinyhttpd` / `genbin` / `htdocs` / `gateway_client` / `ministd` / `ws_server` 已移除。
+舊的 `httpd` / `tinyhttpd` / `genbin` / `htdocs` / `ministd` / `ws_server` 已移除。
 
 ## 初始化
 
@@ -14,6 +15,21 @@
 
 ```bash
 git submodule update --init --recursive
+```
+
+如果要在 macOS 上 build 完整 host stack，先確認 `pkg-config` 能找到 `gateway_client` 需要的套件：
+
+```bash
+brew install pkg-config sdl2 ffmpeg libusb
+```
+
+整套 host binaries clean rebuild：
+
+```bash
+cmake -S . -B build_clean
+cmake --build build_clean --target wsh264
+cmake --build build_clean --target gateway
+cmake --build build_clean --target gateway_client
 ```
 
 ## `wsh264`
@@ -27,6 +43,13 @@ cmake -S . -B build
 cmake --build build --target wsh264
 ```
 
+clean rebuild：
+
+```bash
+cmake -S . -B build_clean
+cmake --build build_clean --target wsh264
+```
+
 也可以獨立建 `wsh264` 子專案：
 
 ```bash
@@ -37,7 +60,7 @@ cmake --build wsh264/build --target wsh264
 執行：
 
 ```bash
-./build/wsh264 wsh264/test_data/iphone_baseline.h264
+./build/wsh264/wsh264 wsh264/test_data/iphone_baseline.h264
 ```
 
 注意：
@@ -62,6 +85,40 @@ cmake --build build --target gateway
 ```bash
 ./build/bin/gateway --listen-port 19000 --upstream-host 127.0.0.1 --upstream-port 8081
 ```
+
+## `gateway_client`
+
+`gateway_client` 是 host 端播放 client，連 `gateway` 的 downstream framed stream，自己解 H.264/PCM，並用 SDL 顯示 video 和播放 audio。支援：
+
+- `--transport tcp`
+- `--transport usb`
+
+建置：
+
+```bash
+cmake -S . -B build
+cmake --build build --target gateway_client
+```
+
+執行：
+
+```bash
+./build/bin/gateway_client --transport tcp --host 127.0.0.1 --port 19000
+```
+
+或 USB：
+
+```bash
+./build/bin/gateway_client --transport usb --usb-vid 0x0BDA --usb-pid 0x8195
+```
+
+`gateway_client` 需要 `pkg-config` 可以找到：
+
+- `sdl2`
+- `libavcodec`
+- `libavutil`
+- `libswscale`
+- `libusb-1.0`
 
 ## Ameba SDK 檔案整理
 

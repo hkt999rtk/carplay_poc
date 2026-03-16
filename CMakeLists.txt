@@ -4,3 +4,4 @@ project(carplay_poc C CXX)
 
 add_subdirectory(wsh264)
 add_subdirectory(gateway)
+add_subdirectory(gateway_client)

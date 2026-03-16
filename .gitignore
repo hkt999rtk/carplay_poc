@@ -1,5 +1,6 @@
 *.o
 build
+build_*/
 .DS_Store
 .local/
 setting.xml
