@@ -34,6 +34,19 @@ tar -xzf tools/sdk-ameba-v5.2g_gcc.tar.gz -C ./.local
 - 解壓後 SDK 根目錄應為 `./.local/sdk-ameba-v5.2g_gcc/`
 - `./.local/` 已加入 `.gitignore`，不直接進 Git
 
+### macOS 需求
+
+- 安裝 Arm GNU toolchain，預設使用 `/Applications/ARM/bin/arm-none-eabi-gcc`
+- 安裝 Docker Desktop，讓 macOS wrapper 代跑 SDK 內的 `elf2bin.linux` / `checksum.linux`
+- 安裝 `gawk`（`postbuild.sh` 會用到）
+- macOS host 只借用 `arm-none-eabi-gcc` / `g++` / `objcopy` 這類 cross-compiler frontend binary
+- `libc.a`、`libm.a`、`libnosys.a`、`libgcc.a` 與其他 target-side runtime / support libs，必須強制使用 SDK bundled toolchain 內那一份，不要混用 host Arm package 自帶的 target libs
+- 換句話說：macOS build 的核心原則是「host compiler binary from macOS, target runtime libs from SDK」
+
+```bash
+brew install gawk
+```
+
 ## Build
 
 ### HTTP server
@@ -75,6 +88,26 @@ make clean
 make
 ```
 
+如果是在 macOS，改用 repo 內的 wrapper script：
+
+```bash
+./scripts/build_ameba_firmware.sh --macos-host-toolchain
+```
+
+如需指定 Arm toolchain 位置：
+
+```bash
+ARM_GCC_TOOLCHAIN=/path/to/arm/bin ./scripts/build_ameba_firmware.sh --macos-host-toolchain
+```
+
+macOS 下還要特別注意：
+
+- 這個 `ARM_GCC_TOOLCHAIN` 只是在指定 host 上要執行哪個 `arm-none-eabi-gcc`
+- 最後 link 時吃進去的 `libc` / `libgcc` / `libnosys` 等 target library，不應該來自 host Arm package，而要強制回到 `./.local/sdk-ameba-v5.2g_gcc/tools/arm-none-eabi-gcc/` 底下 SDK bundled 那份
+- 如果這兩邊混用，最容易出現的就是 link-time incompatibility，例如 newlib / startup object / specs 行為和 SDK Makefile 的假設不一致
+- `--macos-host-toolchain` 這個 flag 是刻意把 macOS 分流和 Linux 原生 SDK `make` 隔開；Linux 仍然維持原本 `cd .../GCC-RELEASE && make clean && make` 的行為
+- macOS wrapper 目前會重用 SDK sample `FW/1115_EVB_WITHOUT_DEVID/flash_is.bin` 的 prefix 來組 `application_is/flash_is.bin`；如需改成別的 sample，可用 `AMEBA_FLASH_TEMPLATE=/path/to/FW/.../flash_is.bin`
+
 這個 firmware build 才依賴 AmebaPro SDK。第一次編譯時會由 SDK Makefile 自動把 bundled Arm GCC 展開到 `./.local/sdk-ameba-v5.2g_gcc/tools/arm-none-eabi-gcc/asdk/linux/`。
 
 要產生可直接燒錄的完整 image，這裡要用 `make`，因為 SDK 會先 build `ram_lp`，再 build `ram_is`；單跑 `make ram_is` 不會先產生 `application_lp/Debug/bin/application_lp.axf`，最後 image packaging 會不完整。
@@ -83,6 +116,60 @@ make
 
 - `./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE/application_is/flash_is.bin`
 - `./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE/application_is/firmware_is.bin`
+- `./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE/application_is/ota_is.bin`
+
+### macOS burn / download
+
+macOS 這邊目前驗證過可以用 CrossOver 26 啟動 `tools/amebapro-image-tool-v1.3 1.zip` 內的 `ImageTool.exe`。這個 tool 是 Windows `.NET` GUI downloader，不只是 image generator。
+
+建議先把 zip 解到本機目錄：
+
+```bash
+mkdir -p "$HOME/.local/amebapro-image-tool"
+unzip -oq "tools/amebapro-image-tool-v1.3 1.zip" -d "$HOME/.local/amebapro-image-tool"
+```
+
+如果還沒有專用 bottle，可先建一個：
+
+```bash
+"/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxbottle" \
+  --bottle amebapro-tool \
+  --create
+```
+
+啟動 downloader：
+
+```bash
+"/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxstart" \
+  --bottle amebapro-tool \
+  --no-wait \
+  "$HOME/.local/amebapro-image-tool/amebapro-image-tool-v1.3/ImageTool.exe"
+```
+
+這個 tool 走的是 UART download，所以真正燒錄前還要把 macOS 的 serial device 映射成 bottle 內的 `COM` port。
+
+先找裝置：
+
+```bash
+ls /dev/cu.*
+```
+
+正常要看到的會是像 `/dev/cu.usbserial-*`、`/dev/cu.usbmodem*`、`/dev/cu.SLAB_USBtoUART` 這類 USB-UART 節點。只有看到 `Bluetooth-Incoming-Port`、`debug-console` 這種系統裝置時，不要直接映射。
+
+找到正確 UART 後，把它映射進 CrossOver bottle：
+
+```bash
+ln -sf /dev/cu.usbserial-XXXX \
+  "$HOME/Library/Application Support/CrossOver/Bottles/amebapro-tool/dosdevices/com1"
+```
+
+之後再重開 `ImageTool.exe`，在 tool 裡選 `COM1`。
+
+目前已確認：
+
+- CrossOver 26 可以把 `ImageTool.exe` 視窗拉起來
+- 如果沒有真正的 USB UART 節點，就沒有東西可映射到 `COM1`
+- tool 在 CrossOver/Wine Mono 下仍可能出現部分 GUI / WMI / D3D warning，所以「能啟動」已確認，但「穩定燒錄」仍要看實際 UART driver 與板子連線狀態
 
 gateway/Ameba 端目前的主線是：
 

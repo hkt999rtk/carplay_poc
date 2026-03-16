@@ -1,0 +1,42 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+
+cleanup() {
+    if [ -n "${tmp_json:-}" ] && [ -f "$tmp_json" ]; then
+        rm -f "$tmp_json"
+    fi
+}
+
+if [ "${1:-}" = "convert" ] && [ "$#" -ge 3 ]; then
+    json_path="$2"
+    json_dir=$(dirname "$json_path")
+    json_name=$(basename "$json_path")
+    tmp_json=$(mktemp "$json_dir/.${json_name%.json}.macos.XXXXXX")
+    trap cleanup EXIT INT TERM HUP
+
+    if [ "$json_name" = "amebapro_bootloader.json" ] && [ "$3" = "PARTITIONTABLE" ]; then
+        perl -0pe '
+            s/\r//g;
+            s/"PROFILE"\s*:\s*\[[^\]]*\]/"PROFILE": [\n\t\t"PARTITIONTABLE"\n\t]/s;
+            s/,\s*"BOOTLOADER"\s*:\s*\{.*\}\s*\}\s*$/\n}/s;
+        ' "$json_path" > "$tmp_json"
+    else
+        tr -d '\r' < "$json_path" > "$tmp_json"
+    fi
+
+    set -- "$1" "$tmp_json" "$3"
+fi
+
+set +e
+"$script_dir/ameba_sdk_tool_proxy.sh" elf2bin.linux "$@"
+rc=$?
+set -e
+
+if [ "$rc" -eq 139 ] && [ "${1:-}" = "otamerge" ] && [ "$#" -ge 4 ] && [ -s "$4" ]; then
+    exit 0
+fi
+
+exit "$rc"
