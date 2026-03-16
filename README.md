@@ -1,11 +1,12 @@
 # carplay_poc
 
-這個 repo 現在保留兩塊：
+這個 repo 現在保留三塊：
 
 - `wsh264/`: host 端 WebSocket H.264/audio source
+- `gateway/`: Linux host relay，接 `wsh264` upstream 並輸出解密後的 framed stream
 - AmebaPro firmware build 與 macOS 燒錄流程
 
-舊的 `httpd` / `tinyhttpd` / `genbin` / `htdocs` / `gateway` / `gateway_client` / `ministd` / `ws_server` 已移除。
+舊的 `httpd` / `tinyhttpd` / `genbin` / `htdocs` / `gateway_client` / `ministd` / `ws_server` 已移除。
 
 ## 初始化
 
@@ -45,6 +46,23 @@ cmake --build wsh264/build --target wsh264
 - `wsh264` 目前相關 code 都在 `wsh264/` 目錄下
 - `wsh264/config.json` 仍是目前保留的預設設定檔
 
+## `gateway`
+
+`gateway` 是 Linux host relay，預設 listen `19000`，並連到 `wsh264` 的 `127.0.0.1:8081` upstream。
+
+建置：
+
+```bash
+cmake -S . -B build
+cmake --build build --target gateway
+```
+
+執行：
+
+```bash
+./build/bin/gateway --listen-port 19000 --upstream-host 127.0.0.1 --upstream-port 8081
+```
+
 ## Ameba SDK 檔案整理
 
 - AmebaPro SDK 壓縮檔放在 `tools/`：`tools/sdk-ameba-v5.2g_gcc.tar.gz`
@@ -73,13 +91,15 @@ macOS host 只借用 `arm-none-eabi-gcc` / `g++` / `objcopy` 這類 cross-compil
 
 ## Build Firmware
 
-Linux 直接走 SDK 原生流程：
+Linux host 這一段是在 build AmebaPro firmware image，不是 build Linux executable。直接走 SDK 原生流程：
 
 ```bash
 cd ./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE
 make clean
 make
 ```
+
+這個 Linux host build 會先產生 `application_lp.axf`，再進一步包出 `application_is/flash_is.bin`。如果目標是可直接燒錄的主 image，主要看的是 `application_is/flash_is.bin`。
 
 macOS 改用 repo 內的 wrapper script：
 
@@ -105,6 +125,8 @@ macOS 下還要特別注意：
 - `./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE/application_is/flash_is.bin`
 - `./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE/application_is/firmware_is.bin`
 - `./.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE/application_is/ota_is.bin`
+
+目前 Linux host 上，SDK 的 `make` 最後仍可能在 `otamerge` / `postbuild` 階段因既有 segfault 以 non-zero exit 結束；這不影響前面已經產生的 `flash_is.bin` 與 `firmware_is.bin`。如果目的只是產出可燒錄的主 image，這個 non-zero exit 可以暫時 waive，並以 `application_is/flash_is.bin` 作為主要燒錄檔。
 
 ## macOS Burn / Download
 
