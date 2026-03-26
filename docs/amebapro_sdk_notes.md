@@ -2,6 +2,53 @@
 
 This note records where the AmebaPro SDK lives in this workspace and how we are using it for firmware builds.
 
+## Recommended Workflow Split
+
+Use different hosts for the two halves of this project:
+
+- Windows host:
+  - build and run `wsh264`
+  - build and run `gateway_client`
+  - flash firmware with ImageTool
+  - watch UART over `COM3` / `COM4`
+- WSL Ubuntu:
+  - build Ameba firmware images
+  - copy the finished `flash_is.bin` back to the Windows desktop
+
+This split is now the recommended path because:
+
+- the Windows host tools are already stable on MSYS2 UCRT64
+- the Ameba firmware Wi-Fi STA path was only validated successfully with a WSL/Linux build
+
+## WSL Firmware Build
+
+Use this script from WSL:
+
+- `scripts/build_ameba_firmware_wsl.sh`
+
+Example from PowerShell:
+
+```powershell
+wsl -d Ubuntu-22.04 -u root -- bash /mnt/c/Users/hkt99/work/carplay_poc/scripts/build_ameba_firmware_wsl.sh
+```
+
+What it does:
+
+- extracts the SDK Linux toolchain into `/root/ameba_toolchains` if needed
+- builds the current firmware project from:
+  - `.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE`
+- copies the resulting image to:
+  - `C:\Users\hkt99\Desktop\flash_is.bin`
+
+The WSL script is the preferred Ameba firmware build path for this workspace.
+
+Known current behavior of the WSL script:
+
+- `application.is.mk` may still return non-zero during the final `manipulate_images` / postbuild stage
+- if `application_is/flash_is.bin` exists, the script treats the build as usable
+- the script still copies that image to:
+  - `C:\Users\hkt99\Desktop\flash_is.bin`
+
 ## SDK Location
 
 - SDK archive in repo:
@@ -23,6 +70,30 @@ It is hooked into the SDK example framework through:
 - `.local/sdk-ameba-v5.2g_gcc/component/common/example/example_entry.c`
 - `.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/inc/platform_opts.h`
 - `.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE/application.is.mk`
+
+## Current Gateway Bring-Up Direction
+
+The current `gateway` firmware image is being brought up in this order:
+
+1. `wlan_network()` in `main.c`
+2. `example_gateway_ameba()`
+3. `gateway_ameba_task()`
+4. `wifi_on(STA) -> wifi_connect() -> DHCP`
+5. USB bulk bring-up after Wi-Fi is ready or has at least attempted to connect
+
+This is now aligned with the validated STA sample behavior:
+
+- let `wlan_network()` perform the normal SDK bring-up first
+- call `wifi_on(STA)` again from the gateway task if needed
+- call `wifi_connect()` with the local hotspot credentials
+- start DHCP
+- start USB after the Wi-Fi stage
+
+The Wi-Fi STA credentials are still sourced from the local-only file:
+
+- `ameba_gateway/gateway_wifi_local_config.h`
+
+This file is intentionally not committed.
 
 ## What The Current Firmware Does
 
@@ -61,6 +132,8 @@ Convenience copy used for flashing from Windows desktop:
   - `C:\Users\hkt99\Desktop\flash_is_usb_pingpong_baseline.bin`
 
 After each successful rebuild, copy the new `flash_is.bin` from the SDK output directory to the desktop copy.
+
+When using the WSL build script above, the desktop copy is updated automatically.
 
 ## Known-Good USB Baseline
 
@@ -264,6 +337,51 @@ make clean
 make
 ```
 
+## WSL Wi-Fi Validation Result
+
+The decisive STA validation was done with a WSL-built image derived from the SDK `high_load_memory_use` sample.
+
+Observed UART progression:
+
+- `Initializing WIFI ...`
+- `WIFI initialized`
+- `WIFI is already running`
+- `[Driver]: set ssid [KeviniPhone]`
+- `[Driver]: start auth ...`
+- `[Driver]: auth success, start assoc`
+- `[Driver]: association success(res=2)`
+- `Wi-Fi connected, starting DHCP`
+- `Interface 0 IP address : 172.20.10.3`
+
+This proved that:
+
+- STA mode works on this board family
+- `wifi_on()` succeeds
+- `wifi_connect()` succeeds
+- DHCP succeeds
+
+Important lab condition:
+
+- iPhone hotspot `Maximum Compatibility` had to be enabled for the successful connection above
+
+## Current Integrated Gateway Image
+
+Current desktop image after integrating the STA-first gateway flow:
+
+- `C:\Users\hkt99\Desktop\flash_is.bin`
+- SHA256:
+  - `BEB7B4266DA0C272BA7F954D9137F9BB6C5C909F5BAC8738ACC1F96A795D88C6`
+
+This image was produced by:
+
+- `scripts/build_ameba_firmware_wsl.sh`
+
+The script finished with a tolerated postbuild segfault, but it successfully produced:
+
+- `application_is/flash_is.bin`
+- `application_is/firmware_is.bin`
+- `application_is/ota_is.bin`
+
 ## Windows Host Notes
 
 This workspace does not include the original SDK Windows toolchain zip.
@@ -406,3 +524,113 @@ If the SDK is re-extracted, re-check:
 - `platform_opts.h`
 - `application.is.mk`
 - `application.lp.mk`
+
+## Pristine WSL Firmware Baseline
+
+The current firmware source-of-truth for Wi-Fi work is the pristine SDK copy under:
+
+- `C:\Users\hkt99\work\carplay_poc\.scratch\pristine_20260325_2\sdk-ameba-v5.2g_gcc`
+
+This copy is used because:
+
+- the original WSL-built STA sample successfully connected to `KeviniPhone`
+- `.local/sdk-ameba-v5.2g_gcc` already contains many bring-up experiments
+- the current integration work is meant to preserve the sample-proven Wi-Fi path and add `gateway` in small steps
+
+Current integration stage on the pristine SDK:
+
+- keep `high_load_memory_use` as the Wi-Fi baseline
+- launch `example_gateway_ameba()` only after `wifi_connect()` succeeds and DHCP is started
+- compile `example_gateway_ameba.c` with:
+  - `GATEWAY_AMEBA_ASSUME_WIFI_SAMPLE=1`
+  - `GATEWAY_AMEBA_ENABLE_USB=0`
+- this means the current gateway-integrated image is:
+  - Wi-Fi sample first
+  - gateway task second
+  - USB intentionally disabled for this stage
+
+Current desktop image from this stage:
+
+- `C:\Users\hkt99\Desktop\flash_is.bin`
+- SHA256: `816BF06BCFA67AD5B1445FB94B1E4925921829B5AA3412D761F7174834DB7958`
+- size: `2102528` bytes
+
+## WSL Build Quirk: cmd_shell.o
+
+The pristine SDK `application.is.mk` can leave `application_is/Debug/obj/cmd_shell.o` missing even though the source object already exists at:
+
+- `component/soc/realtek/8195b/app/shell/cmd_shell.o`
+
+Observed behavior:
+
+- `make -f application.is.mk all` may fail at final link with:
+  - `arm-none-eabi-gcc: error: application_is/Debug/obj/cmd_shell.o: No such file or directory`
+- this is not a real compile failure; it is an object-copy/workdir quirk in the SDK makefile
+
+Current workaround, now built into [build_ameba_firmware_wsl.sh](/C:/Users/hkt99/work/carplay_poc/scripts/build_ameba_firmware_wsl.sh):
+
+- after `application.lp.mk` finishes
+- if `component/.../cmd_shell.o` exists
+- and `application_is/Debug/obj/cmd_shell.o` does not exist
+- copy it into `application_is/Debug/obj/` before running `application.is.mk`
+
+This workaround is required for the pristine WSL firmware path to produce a stable `flash_is.bin`.
+
+## Lessons Learned
+
+These are the main takeaways from the bring-up work so we do not have to rediscover them later.
+
+### 1. Split the workflow by host
+
+- Build `wsh264` and `gateway_client` on Windows
+- Build Ameba firmware in WSL
+- Flash and inspect UART from Windows
+
+Trying to force the firmware build through the Windows-side replacement toolchain cost a lot of time and produced unstable results. The stable path for firmware is now WSL/Linux.
+
+### 2. Treat `flash_is.bin` as the real deliverable
+
+- The file that matters for flashing is `application_is/flash_is.bin`
+- The desktop copy `C:\Users\hkt99\Desktop\flash_is.bin` is the handoff image for ImageTool
+- The final SDK postbuild stage may still crash, but if `flash_is.bin` already exists it is usually still usable
+
+### 3. Wi-Fi on this board is not fundamentally broken
+
+The successful WSL-built STA sample proved:
+
+- `wifi_on()` works
+- `wifi_connect()` works
+- DHCP works
+
+The successful result was only observed after enabling iPhone hotspot `Maximum Compatibility`.
+
+### 4. Use the sample-proven STA sequence
+
+For the current gateway firmware, the safest order is:
+
+1. let `wlan_network()` run
+2. in the gateway task, call `wifi_on(STA)` / `wifi_connect()` / `LwIP_DHCP()`
+3. only then bring up USB
+
+This sequence is closer to the SDK sample that actually worked on hardware.
+
+### 5. Ameba USB bulk needs both `req->buf` and `req->dma`
+
+If bulk traffic reaches the board but payload bytes still look wrong:
+
+- do not assume cache is the first problem
+- first verify `req->buf`
+- then verify `req->dma`
+
+On this USB stack, assigning only `req->buf` is not enough for correct payload decode.
+
+### 6. Preserve known-good rollback points
+
+When something works, always keep:
+
+- the desktop image
+- the SHA256
+- the UART signature of success
+- the exact build path used
+
+That habit already saved time during the USB ping/pong bring-up and again during the Wi-Fi validation stage.

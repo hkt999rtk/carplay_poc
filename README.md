@@ -246,6 +246,10 @@ cmake --build --preset macos-debug --target gateway_client
 
 ## Ameba SDK 檔案整理
 
+SDK 的實際使用位置、gateway firmware 掛接點、產物路徑與 Windows host build 備忘，另外整理在：
+
+- [docs/amebapro_sdk_notes.md](/C:/Users/hkt99/work/carplay_poc/docs/amebapro_sdk_notes.md)
+
 - AmebaPro SDK 壓縮檔放在 `tools/`：`tools/sdk-ameba-v5.2g_gcc.tar.gz`
 - 本機開發前先解壓到 `./.local`
 
@@ -343,3 +347,26 @@ unzip -oq "tools/amebapro-image-tool-v1.3 1.zip" -d "$HOME/.local/amebapro-image
 ln -sf /dev/cu.usbserial-XXXX \
   "$HOME/Library/Application Support/CrossOver/Bottles/amebapro-tool/dosdevices/com1"
 ```
+
+## Current Recommended Workflow
+
+- Build and run `wsh264` on Windows
+- Build and run `gateway_client` on Windows
+- Build Ameba firmware in WSL Ubuntu
+- Flash the resulting `flash_is.bin` from Windows ImageTool
+
+Recommended firmware build command from PowerShell:
+
+```powershell
+wsl -d Ubuntu-22.04 -u root -- bash /mnt/c/Users/hkt99/work/carplay_poc/scripts/build_ameba_firmware_wsl.sh
+```
+
+By default this script builds from the pristine SDK copy at:
+
+- `C:\Users\hkt99\work\carplay_poc\.scratch\pristine_20260325_2\sdk-ameba-v5.2g_gcc`
+
+Why this split is recommended:
+
+- the Windows host tools are already stable on MSYS2 UCRT64
+- the Ameba Wi-Fi STA path was validated successfully with the WSL/Linux firmware build
+- the WSL script updates the desktop image at `C:\Users\hkt99\Desktop\flash_is.bin`

@@ -8,10 +8,23 @@
 #include "diag.h"
 #include "example_gateway_ameba.h"
 #include "hal_cache.h"
+#include "lwip_netconf.h"
 #include "usb.h"
 #include "usb_gadget.h"
+#include "wifi_conf.h"
+#include "wifi_constants.h"
+#include "wifi_ind.h"
+#include "gateway_wifi_local_config.h"
 
-#define GATEWAY_AMEBA_DIAG_STAGE_MINIMAL 1
+#define GATEWAY_AMEBA_DIAG_STAGE_MINIMAL 0
+
+#ifndef GATEWAY_AMEBA_ASSUME_WIFI_SAMPLE
+#define GATEWAY_AMEBA_ASSUME_WIFI_SAMPLE 0
+#endif
+
+#ifndef GATEWAY_AMEBA_ENABLE_USB
+#define GATEWAY_AMEBA_ENABLE_USB 1
+#endif
 
 #define GATEWAY_AMEBA_TASK_STACK_SIZE 3072
 #define GATEWAY_AMEBA_TASK_PRIORITY   (tskIDLE_PRIORITY + 1)
@@ -57,6 +70,21 @@ static volatile u8 gateway_usb_last_bytes[4] = {0};
 static volatile u8 gateway_usb_last_req_dump[16] = {0};
 static volatile u8 gateway_usb_last_ctx_dump[16] = {0};
 static volatile int gateway_usb_last_ping_valid = 0;
+static volatile int gateway_wifi_connect_started = 0;
+static volatile int gateway_wifi_connected = 0;
+static volatile int gateway_wifi_dhcp_ready = 0;
+static volatile int gateway_wifi_task_finished = 0;
+static volatile int gateway_wifi_last_connect_rc = RTW_ERROR;
+static volatile int gateway_task_create_attempted = 0;
+static volatile int gateway_task_created = 0;
+static volatile int gateway_task_running = 0;
+static volatile int gateway_task_create_rc = -999;
+static volatile int gateway_usb_start_attempted = 0;
+static volatile int gateway_usb_start_rc = -999;
+static volatile unsigned long gateway_wifi_connect_attempts = 0;
+static volatile unsigned long gateway_wifi_disconnect_count = 0;
+
+extern struct netif xnetif[NET_IF_NUM];
 
 static int gateway_usb_function_set_alt(struct usb_function *function,
 					unsigned interface, unsigned alt);
@@ -535,7 +563,9 @@ static int gateway_usb_start(void)
 {
 	int status;
 
+	gateway_usb_start_attempted = 1;
 	if (gateway_usb_started) {
+		gateway_usb_start_rc = 0;
 		return 0;
 	}
 
@@ -548,17 +578,132 @@ static int gateway_usb_start(void)
 		} else {
 			printf("[gateway][usb] USB init failed status=%d\r\n", status);
 		}
+		gateway_usb_start_rc = -1;
 		return -1;
 	}
 
 	status = usb_composite_probe(&gateway_usb_driver);
 	if (status != 0) {
 		printf("[gateway][usb] usb_composite_probe failed status=%d\r\n", status);
+		gateway_usb_start_rc = status;
 		return -1;
 	}
 
 	gateway_usb_started = 1;
+	gateway_usb_start_rc = 0;
 	printf("[gateway][usb] vendor bulk device initialized vid=0x0BDA pid=0x8195\r\n");
+	return 0;
+}
+
+static int gateway_wifi_has_ip(void)
+{
+	unsigned char *ip = LwIP_GetIP(&xnetif[0]);
+
+	if (ip == NULL) {
+		return 0;
+	}
+
+	return (ip[0] | ip[1] | ip[2] | ip[3]) != 0;
+}
+
+static void gateway_wifi_log_ip(const char *tag)
+{
+	unsigned char *ip = LwIP_GetIP(&xnetif[0]);
+
+	if (ip == NULL) {
+		dbg_printf("[gateway][wifi] %s ip unavailable\r\n", tag);
+		return;
+	}
+
+	dbg_printf("[gateway][wifi] %s ip=%u.%u.%u.%u\r\n",
+		   tag, ip[0], ip[1], ip[2], ip[3]);
+}
+
+static void gateway_wifi_connect_hdl(char *buf, int buf_len, int flags, void *userdata)
+{
+	(void)buf;
+	(void)buf_len;
+	(void)flags;
+	(void)userdata;
+	gateway_wifi_connected = 1;
+	dbg_printf("[gateway][wifi] WIFI_EVENT_CONNECT\r\n");
+}
+
+static void gateway_wifi_disconnect_hdl(char *buf, int buf_len, int flags, void *userdata)
+{
+	(void)buf;
+	(void)buf_len;
+	(void)flags;
+	(void)userdata;
+	gateway_wifi_connected = 0;
+	gateway_wifi_dhcp_ready = 0;
+	++gateway_wifi_disconnect_count;
+	dbg_printf("[gateway][wifi] WIFI_EVENT_DISCONNECT count=%lu\r\n",
+		   gateway_wifi_disconnect_count);
+}
+
+static int gateway_wifi_bring_up_sta(void)
+{
+	TickType_t deadline;
+	int dhcp_rc;
+	int wifi_on_rc;
+
+	gateway_wifi_connect_started = 1;
+	gateway_wifi_task_finished = 0;
+	++gateway_wifi_connect_attempts;
+
+	dbg_printf("[gateway][wifi] enabling STA for \"%s\"\r\n",
+		   GATEWAY_WIFI_STA_SSID);
+	wifi_on_rc = wifi_on(RTW_MODE_STA);
+	dbg_printf("[gateway][wifi] wifi_on rc=%d\r\n", wifi_on_rc);
+	if (wifi_on_rc != RTW_SUCCESS) {
+		gateway_wifi_last_connect_rc = wifi_on_rc;
+		gateway_wifi_task_finished = 1;
+		return -1;
+	}
+
+	wifi_reg_event_handler(WIFI_EVENT_CONNECT, gateway_wifi_connect_hdl, NULL);
+	wifi_reg_event_handler(WIFI_EVENT_DISCONNECT, gateway_wifi_disconnect_hdl, NULL);
+
+	dbg_printf("[gateway][wifi] connecting to \"%s\"\r\n",
+		   GATEWAY_WIFI_STA_SSID);
+	gateway_wifi_last_connect_rc = wifi_connect((char *)GATEWAY_WIFI_STA_SSID,
+						      GATEWAY_WIFI_STA_SECURITY,
+						      (char *)GATEWAY_WIFI_STA_PASSWORD,
+						      (int)strlen(GATEWAY_WIFI_STA_SSID),
+						      (int)strlen(GATEWAY_WIFI_STA_PASSWORD),
+						      -1,
+						      NULL);
+	dbg_printf("[gateway][wifi] wifi_connect rc=%d attempts=%lu\r\n",
+		   gateway_wifi_last_connect_rc,
+		   gateway_wifi_connect_attempts);
+	if (gateway_wifi_last_connect_rc != RTW_SUCCESS) {
+		gateway_wifi_task_finished = 1;
+		return -1;
+	}
+
+	dbg_printf("[gateway][wifi] connected, starting DHCP\r\n");
+	dhcp_rc = LwIP_DHCP(0, DHCP_START);
+	dbg_printf("[gateway][wifi] LwIP_DHCP rc=%d\r\n", dhcp_rc);
+	if (dhcp_rc != 0) {
+		gateway_wifi_task_finished = 1;
+		return -1;
+	}
+
+	deadline = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
+	while (!gateway_wifi_has_ip()) {
+		if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
+			dbg_printf("[gateway][wifi] DHCP timeout connected=%d\r\n",
+				   gateway_wifi_connected);
+			gateway_wifi_task_finished = 1;
+			return -1;
+		}
+		vTaskDelay(pdMS_TO_TICKS(500));
+	}
+
+	gateway_wifi_dhcp_ready = 1;
+	gateway_wifi_task_finished = 1;
+	gateway_wifi_log_ip("DHCP ready");
 	return 0;
 }
 
@@ -567,7 +712,6 @@ static void gateway_diag_task(void *param)
 {
 	unsigned long heartbeat_counter = 0;
 	TickType_t last_heartbeat_tick;
-	int usb_start_rc;
 
 	(void)param;
 
@@ -575,57 +719,20 @@ static void gateway_diag_task(void *param)
 	dbg_printf("[gateway][diag] scheduler is alive tick=%lu heap=%lu\r\n",
 		   (unsigned long)xTaskGetTickCount(),
 		   (unsigned long)xPortGetFreeHeapSize());
-	dbg_printf("[gateway][diag] starting USB bring-up from minimal task\r\n");
-
-	vTaskDelay(pdMS_TO_TICKS(200));
-	usb_start_rc = gateway_usb_start();
-	dbg_printf("[gateway][diag] gateway_usb_start rc=%d\r\n", usb_start_rc);
+	dbg_printf("[gateway][diag] minimal Wi-Fi validation image: no USB, no gateway task\r\n");
 
 	last_heartbeat_tick = xTaskGetTickCount();
 	for (;;) {
-		gateway_usb_try_force_configure();
 		if ((xTaskGetTickCount() - last_heartbeat_tick) >= pdMS_TO_TICKS(GATEWAY_AMEBA_HEARTBEAT_MS)) {
 			last_heartbeat_tick = xTaskGetTickCount();
-			dbg_printf("[gateway][diag] heartbeat counter=%lu tick=%lu heap=%lu usb_started=%d usb_cfg=%d rx=%lu tx=%lu\r\n",
+			dbg_printf("[gateway][diag] heartbeat counter=%lu tick=%lu heap=%lu wifi_task=%d wifi_conn=%d wifi_ip=%d wifi_rc=%d\r\n",
 				   heartbeat_counter++,
 				   (unsigned long)xTaskGetTickCount(),
 				   (unsigned long)xPortGetFreeHeapSize(),
-				   gateway_usb_started,
-				   gateway_usb_configured,
-				   gateway_usb_rx_packets,
-				   gateway_usb_tx_packets);
-			dbg_printf("[gateway][usbdbg] last_valid=%d actual=%lu magic=%02x %02x %02x %02x seq=%lu payload=%lu bytes=%02x %02x %02x %02x\r\n",
-				   gateway_usb_last_ping_valid,
-				   gateway_usb_last_actual,
-				   gateway_usb_last_magic[0],
-				   gateway_usb_last_magic[1],
-				   gateway_usb_last_magic[2],
-				   gateway_usb_last_magic[3],
-				   gateway_usb_last_seq,
-				   gateway_usb_last_payload_len,
-				   gateway_usb_last_bytes[0],
-				   gateway_usb_last_bytes[1],
-				   gateway_usb_last_bytes[2],
-				   gateway_usb_last_bytes[3]);
-			dbg_printf("[gateway][usbdbg2] req=0x%08lx ctx=0x%08lx req[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x ctx[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x\r\n",
-				   gateway_usb_last_req_buf_addr,
-				   gateway_usb_last_ctx_buf_addr,
-				   gateway_usb_last_req_dump[0],
-				   gateway_usb_last_req_dump[1],
-				   gateway_usb_last_req_dump[2],
-				   gateway_usb_last_req_dump[3],
-				   gateway_usb_last_req_dump[4],
-				   gateway_usb_last_req_dump[5],
-				   gateway_usb_last_req_dump[6],
-				   gateway_usb_last_req_dump[7],
-				   gateway_usb_last_ctx_dump[0],
-				   gateway_usb_last_ctx_dump[1],
-				   gateway_usb_last_ctx_dump[2],
-				   gateway_usb_last_ctx_dump[3],
-				   gateway_usb_last_ctx_dump[4],
-				   gateway_usb_last_ctx_dump[5],
-				   gateway_usb_last_ctx_dump[6],
-				   gateway_usb_last_ctx_dump[7]);
+				   gateway_wifi_connect_started,
+				   gateway_wifi_connected,
+				   gateway_wifi_dhcp_ready,
+				   gateway_wifi_last_connect_rc);
 		}
 
 		vTaskDelay(pdMS_TO_TICKS(10));
@@ -637,26 +744,79 @@ static void gateway_ameba_task(void *param)
 {
 	unsigned long heartbeat_counter = 0;
 	TickType_t last_heartbeat_tick;
+	int wifi_rc = 0;
 
 	(void)param;
+	gateway_task_running = 1;
 
 	dbg_printf("\r\n[gateway] AmebaPro gateway firmware booted\r\n");
 	dbg_printf("[gateway] UART log is alive\r\n");
 	dbg_printf("[gateway] FreeRTOS tick=%lu heap=%lu\r\n",
 		   (unsigned long)xTaskGetTickCount(),
 		   (unsigned long)xPortGetFreeHeapSize());
+	printf("\r\n[gateway][printf] task booted tick=%lu heap=%lu\r\n",
+	       (unsigned long)xTaskGetTickCount(),
+	       (unsigned long)xPortGetFreeHeapSize());
 
-	(void)gateway_usb_start();
+#if GATEWAY_AMEBA_ASSUME_WIFI_SAMPLE
+	dbg_printf("[gateway] assuming SDK sample already started Wi-Fi/DHCP\r\n");
+	printf("[gateway][printf] assuming SDK sample already started Wi-Fi/DHCP\r\n");
+	gateway_wifi_connect_started = 1;
+	gateway_wifi_last_connect_rc = RTW_SUCCESS;
+	if (gateway_wifi_has_ip()) {
+		gateway_wifi_connected = 1;
+		gateway_wifi_dhcp_ready = 1;
+		gateway_wifi_log_ip("sample baseline");
+	}
+	gateway_wifi_task_finished = 1;
+#else
+	wifi_rc = gateway_wifi_bring_up_sta();
+	if (wifi_rc == 0) {
+		dbg_printf("[gateway] Wi-Fi ready, starting USB gateway transport\r\n");
+	} else {
+		dbg_printf("[gateway] Wi-Fi bring-up incomplete rc=%d, starting USB diagnostics\r\n",
+			   wifi_rc);
+	}
+#endif
+
+#if GATEWAY_AMEBA_ENABLE_USB
+	wifi_rc = gateway_usb_start();
+	printf("[gateway][printf] gateway_usb_start rc=%d usb_started=%d\r\n",
+	       wifi_rc,
+	       gateway_usb_started);
+#else
+	dbg_printf("[gateway] USB bring-up disabled for pristine Wi-Fi integration stage\r\n");
+	printf("[gateway][printf] USB disabled for pristine Wi-Fi integration stage\r\n");
+#endif
 	last_heartbeat_tick = xTaskGetTickCount();
 
 	for (;;) {
+#if GATEWAY_AMEBA_ASSUME_WIFI_SAMPLE
+		if (!gateway_wifi_dhcp_ready && gateway_wifi_has_ip()) {
+			gateway_wifi_connected = 1;
+			gateway_wifi_dhcp_ready = 1;
+			gateway_wifi_log_ip("sample DHCP ready");
+		}
+#endif
+#if GATEWAY_AMEBA_ENABLE_USB
 		gateway_usb_try_force_configure();
+#endif
 		if ((xTaskGetTickCount() - last_heartbeat_tick) >= pdMS_TO_TICKS(GATEWAY_AMEBA_HEARTBEAT_MS)) {
 			last_heartbeat_tick = xTaskGetTickCount();
-			dbg_printf("[gateway] heartbeat counter=%lu tick=%lu heap=%lu usb_started=%d usb_cfg=%d rx=%lu tx=%lu\r\n",
+			printf("[gateway][printf] heartbeat counter=%lu wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_started=%d usb_cfg=%d\r\n",
+			       heartbeat_counter,
+			       gateway_wifi_connected,
+			       gateway_wifi_dhcp_ready,
+			       gateway_wifi_last_connect_rc,
+			       gateway_usb_started,
+			       gateway_usb_configured);
+			dbg_printf("[gateway] heartbeat counter=%lu tick=%lu heap=%lu wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_started=%d usb_cfg=%d rx=%lu tx=%lu\r\n",
 				   heartbeat_counter++,
 				   (unsigned long)xTaskGetTickCount(),
 				   (unsigned long)xPortGetFreeHeapSize(),
+				   gateway_wifi_connected,
+				   gateway_wifi_dhcp_ready,
+				   gateway_wifi_last_connect_rc,
 				   gateway_usb_started,
 				   gateway_usb_configured,
 				   gateway_usb_rx_packets,
@@ -703,22 +863,61 @@ void example_gateway_ameba(void)
 {
 #if GATEWAY_AMEBA_DIAG_STAGE_MINIMAL
 	dbg_printf("[gateway][diag] staging minimal task only\r\n");
-	if (xTaskCreate(gateway_diag_task,
-			"gw_diag",
-			GATEWAY_AMEBA_TASK_STACK_SIZE,
-			NULL,
-			GATEWAY_AMEBA_TASK_PRIORITY,
-			NULL) != pdPASS) {
+	gateway_task_create_attempted = 1;
+	gateway_task_create_rc = xTaskCreate(gateway_diag_task,
+					     "gw_diag",
+					     GATEWAY_AMEBA_TASK_STACK_SIZE,
+					     NULL,
+					     GATEWAY_AMEBA_TASK_PRIORITY,
+					     NULL);
+	if (gateway_task_create_rc != pdPASS) {
 		dbg_printf("[gateway][diag] failed to create minimal task\r\n");
+	} else {
+		gateway_task_created = 1;
 	}
 #else
-	if (xTaskCreate(gateway_ameba_task,
-			"gateway_ameba",
-			GATEWAY_AMEBA_TASK_STACK_SIZE,
-			NULL,
-			GATEWAY_AMEBA_TASK_PRIORITY,
-			NULL) != pdPASS) {
+	gateway_task_create_attempted = 1;
+	printf("[gateway][printf] example_gateway_ameba() creating task heap=%lu\r\n",
+	       (unsigned long)xPortGetFreeHeapSize());
+	gateway_task_create_rc = xTaskCreate(gateway_ameba_task,
+					     "gateway_ameba",
+					     GATEWAY_AMEBA_TASK_STACK_SIZE,
+					     NULL,
+					     GATEWAY_AMEBA_TASK_PRIORITY,
+					     NULL);
+	if (gateway_task_create_rc != pdPASS) {
 		dbg_printf("[gateway] failed to create gateway task\r\n");
+		printf("[gateway][printf] xTaskCreate failed rc=%d heap=%lu\r\n",
+		       gateway_task_create_rc,
+		       (unsigned long)xPortGetFreeHeapSize());
+	} else {
+		gateway_task_created = 1;
+		printf("[gateway][printf] xTaskCreate ok rc=%d heap=%lu\r\n",
+		       gateway_task_create_rc,
+		       (unsigned long)xPortGetFreeHeapSize());
 	}
 #endif
+}
+
+void gateway_ameba_log_status(void)
+{
+	printf("[gateway][printf] status tick=%lu heap=%lu task_attempted=%d task_created=%d task_running=%d task_rc=%d wifi_started=%d wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_start_attempted=%d usb_start_rc=%d usb_started=%d usb_cfg=%d rx=%lu tx=%lu ping_valid=%d actual=%lu\r\n",
+	       (unsigned long)xTaskGetTickCount(),
+	       (unsigned long)xPortGetFreeHeapSize(),
+	       gateway_task_create_attempted,
+	       gateway_task_created,
+	       gateway_task_running,
+	       gateway_task_create_rc,
+	       gateway_wifi_connect_started,
+	       gateway_wifi_connected,
+	       gateway_wifi_dhcp_ready,
+	       gateway_wifi_last_connect_rc,
+	       gateway_usb_start_attempted,
+	       gateway_usb_start_rc,
+	       gateway_usb_started,
+	       gateway_usb_configured,
+	       gateway_usb_rx_packets,
+	       gateway_usb_tx_packets,
+	       gateway_usb_last_ping_valid,
+	       gateway_usb_last_actual);
 }
