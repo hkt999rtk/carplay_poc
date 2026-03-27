@@ -29,9 +29,6 @@ static int gateway_client_transport_usb_find_interface(
 			uint8_t found_in = 0;
 			uint8_t found_out = 0;
 
-			if (alt->bInterfaceClass != LIBUSB_CLASS_VENDOR_SPEC)
-				continue;
-
 			for (uint8_t k = 0; k < alt->bNumEndpoints; ++k) {
 				const struct libusb_endpoint_descriptor *ep = &alt->endpoint[k];
 
@@ -190,6 +187,43 @@ int gateway_client_transport_usb_read_exact(gateway_client_transport_t *transpor
 	}
 
 	return offset == len ? 1 : 0;
+}
+
+int gateway_client_transport_usb_write_all(gateway_client_transport_t *transport, const void *buf,
+					   size_t len)
+{
+	const uint8_t *ptr = (const uint8_t *)buf;
+	size_t offset = 0;
+
+	if (transport == NULL || transport->usb_handle == NULL)
+		return -1;
+
+	while (offset < len && !transport->stop_requested) {
+		int transferred = 0;
+		int chunk_len = (int)((len - offset) > (size_t)INT_MAX ? INT_MAX : (len - offset));
+		int rc = libusb_bulk_transfer((libusb_device_handle *)transport->usb_handle,
+					      transport->usb_ep_out, (unsigned char *)(ptr + offset),
+					      chunk_len, &transferred,
+					      transport->usb_transfer_timeout_ms);
+
+		if (rc == 0) {
+			if (transferred <= 0) {
+				fprintf(stderr, "gateway_client: libusb bulk write made no progress\n");
+				return -1;
+			}
+			offset += (size_t)transferred;
+			continue;
+		}
+		if (rc == LIBUSB_ERROR_TIMEOUT)
+			continue;
+		if (rc == LIBUSB_ERROR_INTERRUPTED)
+			continue;
+		fprintf(stderr, "gateway_client: libusb bulk write failed: %s\n",
+			libusb_error_name(rc));
+		return -1;
+	}
+
+	return offset == len ? 0 : -1;
 }
 
 void gateway_client_transport_usb_request_stop(gateway_client_transport_t *transport)

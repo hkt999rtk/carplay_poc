@@ -8,6 +8,8 @@ int gateway_client_transport_usb_open(gateway_client_transport_t *transport,
 				      const gateway_client_transport_options_t *options);
 int gateway_client_transport_usb_read_exact(gateway_client_transport_t *transport, void *buf,
 					    size_t len);
+int gateway_client_transport_usb_write_all(gateway_client_transport_t *transport, const void *buf,
+					   size_t len);
 void gateway_client_transport_usb_request_stop(gateway_client_transport_t *transport);
 void gateway_client_transport_usb_close(gateway_client_transport_t *transport);
 
@@ -54,6 +56,15 @@ int gateway_client_transport_read_exact(gateway_client_transport_t *transport, v
 	if (transport->kind == GATEWAY_CLIENT_TRANSPORT_USB)
 		return gateway_client_transport_usb_read_exact(transport, buf, len);
 	return tcp_transport_read_exact(transport->tcp_fd, buf, len);
+}
+
+int gateway_client_transport_write_all(gateway_client_transport_t *transport, const void *buf, size_t len)
+{
+	if (transport == NULL)
+		return -1;
+	if (transport->kind == GATEWAY_CLIENT_TRANSPORT_USB)
+		return gateway_client_transport_usb_write_all(transport, buf, len);
+	return tcp_transport_write_all(transport->tcp_fd, buf, len);
 }
 
 void gateway_client_transport_request_stop(gateway_client_transport_t *transport)

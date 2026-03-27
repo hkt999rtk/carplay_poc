@@ -94,6 +94,10 @@ static sample_scan_info_t sample_scan_home = {0};
 static void high_load_case_memory_usage(void){
 	printf("\n\nMemory usage for high-load use case...\n");
 
+#if CONFIG_EXAMPLE_GATEWAY_AMEBA
+	gateway_ameba_register_atcmd();
+#endif
+
 	
 	/**********************************************************************************
 	*	1. Start heap monitor thread	

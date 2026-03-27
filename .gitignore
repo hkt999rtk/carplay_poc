@@ -1,6 +1,9 @@
 *.o
+*.d
+*.su
 build
 build_*/
+dist/
 dist/windows-ucrt64/
 .DS_Store
 .local/
@@ -17,4 +20,5 @@ ameba_pro1_sdk/overlay/**/*.s
 !.scratch/pristine_20260325_2/sdk-ameba-v5.2g_gcc/component/common/example/high_load_memory_use/example_high_load_memory_use.c
 !.scratch/pristine_20260325_2/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE/application.is.mk
 !.scratch/pristine_20260325_2/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/inc/platform_opts.h
+tools/amebapro-image-tool-v1.3 1/
 tmp/

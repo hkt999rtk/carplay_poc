@@ -19,17 +19,22 @@ target_include_directories(
 
 add_library(
 	wsh264_ws
-	${CMAKE_CURRENT_LIST_DIR}/src/base64.c
-	${CMAKE_CURRENT_LIST_DIR}/src/handshake.c
-	${CMAKE_CURRENT_LIST_DIR}/src/sha1.c
-	${CMAKE_CURRENT_LIST_DIR}/src/utf8.c
-	${CMAKE_CURRENT_LIST_DIR}/src/ws.c
+	${CMAKE_CURRENT_LIST_DIR}/src/ws_wsfs_compat.c
+	${CMAKE_CURRENT_LIST_DIR}/../3rd_party/wsfs/src/base64.c
+	${CMAKE_CURRENT_LIST_DIR}/../3rd_party/wsfs/src/sha1.c
+	${CMAKE_CURRENT_LIST_DIR}/../3rd_party/wsfs/src/utf8.c
+	${CMAKE_CURRENT_LIST_DIR}/../3rd_party/wsfs/src/wsfs_connection.c
+	${CMAKE_CURRENT_LIST_DIR}/../3rd_party/wsfs/src/wsfs_frame_reader.c
+	${CMAKE_CURRENT_LIST_DIR}/../3rd_party/wsfs/src/wsfs_mem.c
+	${CMAKE_CURRENT_LIST_DIR}/../3rd_party/wsfs/src/wsfs_server.c
 )
 
 target_include_directories(
 	wsh264_ws
 	PUBLIC
 	${CMAKE_CURRENT_LIST_DIR}/include
+	${CMAKE_CURRENT_LIST_DIR}/../3rd_party/wsfs/include
+	${CMAKE_CURRENT_LIST_DIR}/../3rd_party/wsfs/src
 )
 
 if (WIN32)

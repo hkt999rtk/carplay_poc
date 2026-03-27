@@ -8,11 +8,34 @@ PROJECT_DIR="$SDK_ROOT/project/realtek_amebapro_v0_example/GCC-RELEASE"
 TOOLCHAIN_ARCHIVE="$SDK_ROOT/tools/arm-none-eabi-gcc/asdk-6.4.1-linux-newlib-build-3026-x86_64.tar.bz2"
 TOOLCHAIN_ROOT="/root/ameba_toolchains"
 TOOLCHAIN_DIR="$TOOLCHAIN_ROOT/asdk-6.4.1/linux/newlib"
-DESKTOP_FLASH="/mnt/c/Users/hkt99/Desktop/flash_is.bin"
 CMD_SHELL_SRC_OBJ="$SDK_ROOT/component/soc/realtek/8195b/app/shell/cmd_shell.o"
 CMD_SHELL_DST_OBJ="$PROJECT_DIR/application_is/Debug/obj/cmd_shell.o"
 JOBS="${JOBS:-1}"
 CLEAN="${CLEAN:-0}"
+
+resolve_desktop_flash()
+{
+	local win_profile=""
+	local win_flash=""
+
+	if [ -n "${DESKTOP_FLASH:-}" ]; then
+		printf '%s\n' "$DESKTOP_FLASH"
+		return
+	fi
+
+	if command -v cmd.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
+		win_profile="$(cmd.exe /c "echo %USERPROFILE%" 2>/dev/null | tr -d '\r' | tail -n 1)"
+		if [ -n "$win_profile" ]; then
+			win_flash="${win_profile}\\Desktop\\flash_is.bin"
+			wslpath "$win_flash"
+			return
+		fi
+	fi
+
+	printf '%s\n' "/mnt/c/Users/Public/Desktop/flash_is.bin"
+}
+
+DESKTOP_FLASH="$(resolve_desktop_flash)"
 
 if [ ! -f "$TOOLCHAIN_ARCHIVE" ]; then
 	echo "Missing SDK toolchain archive: $TOOLCHAIN_ARCHIVE" >&2
@@ -58,6 +81,7 @@ if [ ! -f "$PROJECT_DIR/application_is/flash_is.bin" ]; then
 	exit "${is_status:-1}"
 fi
 
+mkdir -p "$(dirname "$DESKTOP_FLASH")"
 cp "$PROJECT_DIR/application_is/flash_is.bin" "$DESKTOP_FLASH"
 sha256sum "$PROJECT_DIR/application_is/flash_is.bin"
 echo "[wsl-build] copied desktop image to $DESKTOP_FLASH"

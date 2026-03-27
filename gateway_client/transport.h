@@ -42,6 +42,7 @@ void gateway_client_transport_options_default(gateway_client_transport_options_t
 int gateway_client_transport_open(gateway_client_transport_t *transport,
 				  const gateway_client_transport_options_t *options);
 int gateway_client_transport_read_exact(gateway_client_transport_t *transport, void *buf, size_t len);
+int gateway_client_transport_write_all(gateway_client_transport_t *transport, const void *buf, size_t len);
 void gateway_client_transport_request_stop(gateway_client_transport_t *transport);
 void gateway_client_transport_close(gateway_client_transport_t *transport);
 const char *gateway_client_transport_name(const gateway_client_transport_t *transport);

@@ -7,13 +7,21 @@
 #include "core/inc/usb_composite.h"
 #include "diag.h"
 #include "example_gateway_ameba.h"
+#include "gateway_proto.h"
+#include "crypto_stream.h"
+#include "base64.h"
 #include "hal_cache.h"
+#include "log_service.h"
 #include "lwip_netconf.h"
+#include "lwip/errno.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 #include "usb.h"
 #include "usb_gadget.h"
 #include "wifi_conf.h"
 #include "wifi_constants.h"
 #include "wifi_ind.h"
+#include "cJSON.h"
 #include "gateway_wifi_local_config.h"
 
 #define GATEWAY_AMEBA_DIAG_STAGE_MINIMAL 0
@@ -29,7 +37,23 @@
 #define GATEWAY_AMEBA_TASK_STACK_SIZE 3072
 #define GATEWAY_AMEBA_TASK_PRIORITY   (tskIDLE_PRIORITY + 1)
 #define GATEWAY_AMEBA_HEARTBEAT_MS    1000
-#define GATEWAY_AMEBA_USB_PACKET_SIZE 64
+#define GATEWAY_AMEBA_USB_OUT_PACKET_SIZE 64
+#define GATEWAY_AMEBA_USB_IN_CHUNK_SIZE 256
+#define GATEWAY_AMEBA_USB_TX_RING_SIZE (64 * 1024)
+#define GATEWAY_AMEBA_UPSTREAM_RETRY_MS 5000
+#define GATEWAY_AMEBA_USB_STALL_TIMEOUT_MS 2000
+
+#ifndef GATEWAY_AMEBA_UPSTREAM_HOST
+#define GATEWAY_AMEBA_UPSTREAM_HOST "192.168.1.54"
+#endif
+
+#ifndef GATEWAY_AMEBA_UPSTREAM_PORT
+#define GATEWAY_AMEBA_UPSTREAM_PORT 8081
+#endif
+
+#ifndef GATEWAY_AMEBA_UPSTREAM_PATH
+#define GATEWAY_AMEBA_UPSTREAM_PATH "/gateway"
+#endif
 
 #define GATEWAY_USB_STRING_MANUFACTURER 1
 #define GATEWAY_USB_STRING_PRODUCT      2
@@ -55,6 +79,16 @@ typedef struct gateway_usb_function_ctx {
 	int configured;
 	int in_busy;
 } gateway_usb_function_ctx_t;
+
+typedef struct gateway_upstream_state {
+	int fd;
+	uint8_t *prebuffer;
+	size_t prebuffer_len;
+	size_t prebuffer_off;
+	int connected;
+	int have_nonce;
+	uint8_t session_nonce[CRYPTO_STREAM_NONCE_SIZE];
+} gateway_upstream_state_t;
 
 static volatile int gateway_usb_started = 0;
 static volatile int gateway_usb_configured = 0;
@@ -83,8 +117,431 @@ static volatile int gateway_usb_start_attempted = 0;
 static volatile int gateway_usb_start_rc = -999;
 static volatile unsigned long gateway_wifi_connect_attempts = 0;
 static volatile unsigned long gateway_wifi_disconnect_count = 0;
+static volatile int gateway_upstream_connect_started = 0;
+static volatile int gateway_upstream_connected = 0;
+static volatile int gateway_upstream_last_rc = -999;
+static volatile unsigned long gateway_upstream_connect_attempts = 0;
+static volatile unsigned long gateway_upstream_text_frames = 0;
+static volatile unsigned long gateway_upstream_binary_frames = 0;
+static volatile unsigned long gateway_upstream_close_frames = 0;
+static volatile unsigned long gateway_upstream_last_opcode = 0;
+static volatile unsigned long gateway_upstream_last_payload_len = 0;
+static volatile unsigned long gateway_upstream_last_attempt_tick = 0;
+static volatile int gateway_upstream_last_errno = 0;
+static volatile unsigned long gateway_usb_stream_bytes_enqueued = 0;
+static volatile unsigned long gateway_usb_stream_bytes_sent = 0;
+static volatile unsigned long gateway_usb_stream_drop_count = 0;
+static volatile int gateway_usb_host_ready = 0;
+static volatile int gateway_usb_proto_init_sent = 0;
+static volatile int gateway_usb_stream_resetting = 0;
+static volatile int gateway_usb_last_kick_rc = 0;
+static volatile size_t gateway_usb_last_ring_count = 0;
+static volatile unsigned long gateway_usb_stream_kick_count = 0;
+static volatile unsigned long gateway_usb_in_complete_count = 0;
+static volatile unsigned long gateway_usb_in_error_count = 0;
+static volatile unsigned long gateway_usb_fifo_flush_count = 0;
+static volatile unsigned long gateway_usb_watchdog_reset_count = 0;
+static volatile unsigned long gateway_usb_last_queue_len = 0;
+static int gateway_atcmd_registered = 0;
 
 extern struct netif xnetif[NET_IF_NUM];
+static gateway_upstream_state_t gateway_upstream = { -1, NULL, 0, 0, 0 };
+static gateway_usb_function_ctx_t gateway_usb_ctx;
+static u8 gateway_usb_in_buf[GATEWAY_AMEBA_USB_IN_CHUNK_SIZE] __attribute__((aligned(32)));
+static u8 gateway_usb_out_buf[GATEWAY_AMEBA_USB_OUT_PACKET_SIZE] __attribute__((aligned(32)));
+static uint8_t gateway_usb_tx_ring[GATEWAY_AMEBA_USB_TX_RING_SIZE];
+static size_t gateway_usb_tx_head = 0;
+static size_t gateway_usb_tx_tail = 0;
+static size_t gateway_usb_tx_count = 0;
+
+static int gateway_parse_crypto_init(const uint8_t *payload, size_t payload_len,
+				     uint8_t session_nonce[CRYPTO_STREAM_NONCE_SIZE],
+				     int *have_nonce);
+static int gateway_usb_enqueue_init_packet(void);
+static int gateway_usb_enqueue_media_packet(uint8_t stream_id, uint32_t seq_no,
+					    const uint8_t *payload, size_t payload_len);
+static int gateway_usb_kick_tx(gateway_usb_function_ctx_t *ctx);
+static void gateway_usb_retry_init_if_needed(void);
+static void gateway_usb_reset_stream_session(gateway_usb_function_ctx_t *ctx, const char *reason);
+void gateway_ameba_register_atcmd(void);
+extern void sys_reset(void);
+
+static void gateway_upstream_close(gateway_upstream_state_t *state)
+{
+	if (state == NULL) {
+		return;
+	}
+	if (state->fd >= 0) {
+		lwip_close(state->fd);
+	}
+	if (state->prebuffer != NULL) {
+		free(state->prebuffer);
+	}
+	state->fd = -1;
+	state->prebuffer = NULL;
+	state->prebuffer_len = 0;
+	state->prebuffer_off = 0;
+	state->connected = 0;
+	state->have_nonce = 0;
+	memset(state->session_nonce, 0, sizeof(state->session_nonce));
+	gateway_upstream_connected = 0;
+}
+
+static int gateway_upstream_write_all(int fd, const uint8_t *buf, size_t len)
+{
+	size_t written = 0;
+
+	while (written < len) {
+		int rc = lwip_write(fd, buf + written, len - written);
+		if (rc <= 0) {
+			return -1;
+		}
+		written += (size_t)rc;
+	}
+
+	return 0;
+}
+
+static int gateway_upstream_send_masked_frame(int fd, uint8_t opcode,
+					      const uint8_t *payload, size_t length)
+{
+	uint8_t header[14];
+	uint8_t mask[4] = { 0x12, 0x34, 0x56, 0x78 };
+	uint8_t *masked = NULL;
+	size_t header_len = 0;
+	size_t i;
+	int rc;
+
+	header[header_len++] = (uint8_t)(0x80u | opcode);
+	if (length <= 125u) {
+		header[header_len++] = (uint8_t)(0x80u | (uint8_t)length);
+	} else if (length <= 0xFFFFu) {
+		header[header_len++] = 0x80u | 126u;
+		header[header_len++] = (uint8_t)(length >> 8);
+		header[header_len++] = (uint8_t)length;
+	} else {
+		header[header_len++] = 0x80u | 127u;
+		for (i = 0; i < 8u; ++i) {
+			header[header_len++] = (uint8_t)(length >> ((7u - i) * 8u));
+		}
+	}
+
+	memcpy(header + header_len, mask, sizeof(mask));
+	header_len += sizeof(mask);
+	if (gateway_upstream_write_all(fd, header, header_len) != 0) {
+		return -1;
+	}
+
+	if (length == 0u) {
+		return 0;
+	}
+
+	masked = (uint8_t *)malloc(length);
+	if (masked == NULL) {
+		return -1;
+	}
+	for (i = 0; i < length; ++i) {
+		masked[i] = payload[i] ^ mask[i % 4u];
+	}
+	rc = gateway_upstream_write_all(fd, masked, length);
+	free(masked);
+	return rc;
+}
+
+static int gateway_upstream_send_text(int fd, const char *text)
+{
+	return gateway_upstream_send_masked_frame(fd, 0x1u, (const uint8_t *)text, strlen(text));
+}
+
+static int gateway_upstream_read_some(gateway_upstream_state_t *state, uint8_t *dest, size_t len)
+{
+	size_t copied = 0;
+
+	while (copied < len) {
+		if (state->prebuffer != NULL && state->prebuffer_off < state->prebuffer_len) {
+			size_t avail = state->prebuffer_len - state->prebuffer_off;
+			size_t take = avail;
+			if (take > (len - copied)) {
+				take = len - copied;
+			}
+			memcpy(dest + copied, state->prebuffer + state->prebuffer_off, take);
+			state->prebuffer_off += take;
+			copied += take;
+			if (state->prebuffer_off == state->prebuffer_len) {
+				free(state->prebuffer);
+				state->prebuffer = NULL;
+				state->prebuffer_len = 0;
+				state->prebuffer_off = 0;
+			}
+			continue;
+		}
+
+		{
+			int rc = lwip_read(state->fd, dest + copied, len - copied);
+			if (rc <= 0) {
+				return -1;
+			}
+			copied += (size_t)rc;
+		}
+	}
+
+	return 0;
+}
+
+static int gateway_upstream_recv_frame(gateway_upstream_state_t *state, uint8_t *opcode_out,
+				       uint8_t **payload_out, size_t *payload_len_out)
+{
+	uint8_t header[2];
+	uint8_t mask[4] = {0};
+	uint8_t *payload = NULL;
+	size_t payload_len;
+
+	if (gateway_upstream_read_some(state, header, sizeof(header)) != 0) {
+		return -1;
+	}
+
+	*opcode_out = (uint8_t)(header[0] & 0x0Fu);
+	payload_len = (size_t)(header[1] & 0x7Fu);
+	if (payload_len == 126u) {
+		uint8_t ext[2];
+		if (gateway_upstream_read_some(state, ext, sizeof(ext)) != 0) {
+			return -1;
+		}
+		payload_len = ((size_t)ext[0] << 8) | (size_t)ext[1];
+	} else if (payload_len == 127u) {
+		uint8_t ext[8];
+		size_t i;
+		payload_len = 0u;
+		if (gateway_upstream_read_some(state, ext, sizeof(ext)) != 0) {
+			return -1;
+		}
+		for (i = 0; i < 8u; ++i) {
+			payload_len = (payload_len << 8) | (size_t)ext[i];
+		}
+	}
+
+	if ((header[1] & 0x80u) != 0u) {
+		if (gateway_upstream_read_some(state, mask, sizeof(mask)) != 0) {
+			return -1;
+		}
+	}
+
+	if (payload_len > 0u) {
+		size_t i;
+		payload = (uint8_t *)malloc(payload_len);
+		if (payload == NULL) {
+			return -1;
+		}
+		if (gateway_upstream_read_some(state, payload, payload_len) != 0) {
+			free(payload);
+			return -1;
+		}
+		if ((header[1] & 0x80u) != 0u) {
+			for (i = 0; i < payload_len; ++i) {
+				payload[i] ^= mask[i % 4u];
+			}
+		}
+	}
+
+	*payload_out = payload;
+	*payload_len_out = payload_len;
+	return 0;
+}
+
+static int gateway_upstream_connect(gateway_upstream_state_t *state)
+{
+	struct sockaddr_in addr;
+	char request[512];
+	uint8_t response[2048];
+	size_t total = 0;
+	int fd;
+	int written;
+
+	gateway_upstream_connect_started = 1;
+	gateway_upstream_last_attempt_tick = (unsigned long)xTaskGetTickCount();
+	++gateway_upstream_connect_attempts;
+	gateway_upstream_last_errno = 0;
+	state->have_nonce = 0;
+	memset(state->session_nonce, 0, sizeof(state->session_nonce));
+
+	fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		gateway_upstream_last_errno = errno;
+		gateway_upstream_last_rc = -1;
+		return -1;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = lwip_htons(GATEWAY_AMEBA_UPSTREAM_PORT);
+	addr.sin_addr.s_addr = inet_addr(GATEWAY_AMEBA_UPSTREAM_HOST);
+	if (addr.sin_addr.s_addr == IPADDR_NONE) {
+		lwip_close(fd);
+		gateway_upstream_last_errno = errno;
+		gateway_upstream_last_rc = -2;
+		return -1;
+	}
+
+	if (lwip_connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+		gateway_upstream_last_errno = errno;
+		lwip_close(fd);
+		gateway_upstream_last_rc = -3;
+		return -1;
+	}
+
+	written = snprintf(request, sizeof(request),
+			   "GET %s HTTP/1.1\r\n"
+			   "Host: %s:%u\r\n"
+			   "Upgrade: websocket\r\n"
+			   "Connection: Upgrade\r\n"
+			   "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+			   "Sec-WebSocket-Version: 13\r\n"
+			   "\r\n",
+			   GATEWAY_AMEBA_UPSTREAM_PATH,
+			   GATEWAY_AMEBA_UPSTREAM_HOST,
+			   (unsigned)GATEWAY_AMEBA_UPSTREAM_PORT);
+	if (written <= 0 || (size_t)written >= sizeof(request)) {
+		lwip_close(fd);
+		gateway_upstream_last_errno = errno;
+		gateway_upstream_last_rc = -4;
+		return -1;
+	}
+
+	if (gateway_upstream_write_all(fd, (const uint8_t *)request, (size_t)written) != 0) {
+		lwip_close(fd);
+		gateway_upstream_last_errno = errno;
+		gateway_upstream_last_rc = -5;
+		return -1;
+	}
+
+	while (total + 1u < sizeof(response)) {
+		char *header_end;
+		int rc = lwip_read(fd, response + total, sizeof(response) - total - 1u);
+		if (rc <= 0) {
+			lwip_close(fd);
+			gateway_upstream_last_errno = errno;
+			gateway_upstream_last_rc = -6;
+			return -1;
+		}
+		total += (size_t)rc;
+		response[total] = '\0';
+		header_end = strstr((const char *)response, "\r\n\r\n");
+		if (header_end != NULL) {
+			size_t header_len = (size_t)(header_end - (char *)response) + 4u;
+			size_t extra = total - header_len;
+			if (strstr((const char *)response, "101") == NULL) {
+				lwip_close(fd);
+				gateway_upstream_last_errno = errno;
+				gateway_upstream_last_rc = -7;
+				return -1;
+			}
+			if (extra > 0u) {
+				state->prebuffer = (uint8_t *)malloc(extra);
+				if (state->prebuffer == NULL) {
+					lwip_close(fd);
+					gateway_upstream_last_errno = errno;
+					gateway_upstream_last_rc = -8;
+					return -1;
+				}
+				memcpy(state->prebuffer, response + header_len, extra);
+				state->prebuffer_len = extra;
+				state->prebuffer_off = 0;
+			}
+			state->fd = fd;
+			state->connected = 1;
+			gateway_upstream_connected = 1;
+			gateway_upstream_last_rc = 0;
+			if (gateway_upstream_send_text(fd, "{\"cmd\":\"start_stream\",\"param\":{\"mirror\":1}}") != 0 ||
+			    gateway_upstream_send_text(fd, "{\"cmd\":\"start_audio_stream\"}") != 0) {
+				gateway_upstream_close(state);
+				gateway_upstream_last_errno = errno;
+				gateway_upstream_last_rc = -9;
+				return -1;
+			}
+			printf("[gateway][printf] upstream connected host=%s port=%u\r\n",
+			       GATEWAY_AMEBA_UPSTREAM_HOST,
+			       (unsigned)GATEWAY_AMEBA_UPSTREAM_PORT);
+			dbg_printf("[gateway][upstream] connected host=%s port=%u path=%s\r\n",
+				   GATEWAY_AMEBA_UPSTREAM_HOST,
+				   (unsigned)GATEWAY_AMEBA_UPSTREAM_PORT,
+				   GATEWAY_AMEBA_UPSTREAM_PATH);
+			return 0;
+		}
+	}
+
+	lwip_close(fd);
+	gateway_upstream_last_errno = errno;
+	gateway_upstream_last_rc = -10;
+	return -1;
+}
+
+static void gateway_upstream_poll(gateway_upstream_state_t *state)
+{
+	fd_set rfds;
+	struct timeval tv;
+	uint8_t opcode = 0;
+	uint8_t *payload = NULL;
+	size_t payload_len = 0;
+	int rc;
+
+	if (state == NULL || !state->connected || state->fd < 0) {
+		return;
+	}
+
+	FD_ZERO(&rfds);
+	FD_SET(state->fd, &rfds);
+	tv.tv_sec = 0;
+	tv.tv_usec = 0;
+	rc = lwip_select(state->fd + 1, &rfds, NULL, NULL, &tv);
+	if (rc <= 0 || !FD_ISSET(state->fd, &rfds)) {
+		return;
+	}
+
+	if (gateway_upstream_recv_frame(state, &opcode, &payload, &payload_len) != 0) {
+		dbg_printf("[gateway][upstream] recv failed, closing connection\r\n");
+		gateway_upstream_last_errno = errno;
+		gateway_upstream_last_rc = -11;
+		gateway_upstream_close(state);
+		return;
+	}
+
+	gateway_upstream_last_opcode = opcode;
+	gateway_upstream_last_payload_len = payload_len;
+	if (opcode == 0x1u) {
+		++gateway_upstream_text_frames;
+		(void)gateway_parse_crypto_init(payload, payload_len, state->session_nonce, &state->have_nonce);
+	} else if (opcode == 0x2u) {
+		uint8_t stream_id = 0;
+		uint32_t seq_no = 0;
+		uint8_t *plaintext = NULL;
+		int plain_len;
+		++gateway_upstream_binary_frames;
+		if (!state->have_nonce) {
+			free(payload);
+			return;
+		}
+		plaintext = (uint8_t *)malloc(payload_len);
+		if (plaintext == NULL) {
+			free(payload);
+			return;
+		}
+		plain_len = crypto_stream_decrypt_packet(plaintext, payload_len, &stream_id, &seq_no,
+							 state->session_nonce, payload, payload_len);
+		if (plain_len > 0) {
+			if (gateway_usb_started && gateway_usb_configured && gateway_usb_host_ready &&
+			    gateway_usb_enqueue_init_packet() == 0 &&
+			    gateway_usb_enqueue_media_packet(stream_id, seq_no, plaintext, (size_t)plain_len) == 0) {
+				(void)gateway_usb_kick_tx(&gateway_usb_ctx);
+			}
+		}
+		free(plaintext);
+	} else if (opcode == 0x8u) {
+		++gateway_upstream_close_frames;
+		gateway_upstream_close(state);
+	}
+
+	free(payload);
+}
 
 static int gateway_usb_function_set_alt(struct usb_function *function,
 					unsigned interface, unsigned alt);
@@ -188,9 +645,194 @@ static struct usb_descriptor_header *gateway_usb_hs_descs[] = {
 	NULL,
 };
 
-static gateway_usb_function_ctx_t gateway_usb_ctx;
-static u8 gateway_usb_in_buf[GATEWAY_AMEBA_USB_PACKET_SIZE] __attribute__((aligned(32)));
-static u8 gateway_usb_out_buf[GATEWAY_AMEBA_USB_PACKET_SIZE] __attribute__((aligned(32)));
+static uint8_t gateway_video_flags(const uint8_t *payload, size_t payload_len)
+{
+	uint8_t flags = 0;
+	uint8_t nal_type;
+
+	if (payload == NULL || payload_len == 0u)
+		return 0;
+	nal_type = (uint8_t)(payload[0] & 0x1Fu);
+	if (nal_type == 5u)
+		flags |= GATEWAY_PROTO_FLAG_KEYFRAME;
+	if (nal_type == 7u || nal_type == 8u)
+		flags |= GATEWAY_PROTO_FLAG_CONFIG;
+	return flags;
+}
+
+static int gateway_parse_crypto_init(const uint8_t *payload, size_t payload_len,
+				     uint8_t session_nonce[CRYPTO_STREAM_NONCE_SIZE],
+				     int *have_nonce)
+{
+	cJSON *root;
+	cJSON *type;
+	cJSON *result;
+	cJSON *session_nonce_json;
+	unsigned char *decoded;
+	size_t decoded_len;
+	char *text;
+
+	text = (char *)malloc(payload_len + 1u);
+	if (text == NULL)
+		return -1;
+	memcpy(text, payload, payload_len);
+	text[payload_len] = '\0';
+
+	root = cJSON_Parse(text);
+	free(text);
+	if (root == NULL)
+		return 0;
+
+	type = cJSON_GetObjectItem(root, "type");
+	if (type == NULL || type->valuestring == NULL ||
+	    strcmp(type->valuestring, "crypto_init") != 0) {
+		cJSON_Delete(root);
+		return 0;
+	}
+
+	result = cJSON_GetObjectItem(root, "result");
+	session_nonce_json = result != NULL ? cJSON_GetObjectItem(result, "session_nonce") : NULL;
+	if (session_nonce_json == NULL || session_nonce_json->valuestring == NULL) {
+		cJSON_Delete(root);
+		return -1;
+	}
+
+	decoded = base64_decode((const unsigned char *)session_nonce_json->valuestring,
+				strlen(session_nonce_json->valuestring), &decoded_len);
+	if (decoded == NULL || decoded_len != CRYPTO_STREAM_NONCE_SIZE) {
+		free(decoded);
+		cJSON_Delete(root);
+		return -1;
+	}
+
+	memcpy(session_nonce, decoded, CRYPTO_STREAM_NONCE_SIZE);
+	free(decoded);
+	*have_nonce = 1;
+	cJSON_Delete(root);
+	return 0;
+}
+
+static void gateway_usb_tx_reset(void)
+{
+	taskENTER_CRITICAL();
+	gateway_usb_tx_head = 0;
+	gateway_usb_tx_tail = 0;
+	gateway_usb_tx_count = 0;
+	taskEXIT_CRITICAL();
+	gateway_usb_proto_init_sent = 0;
+	gateway_usb_last_ring_count = 0;
+	gateway_usb_last_queue_len = 0;
+}
+
+static size_t gateway_usb_tx_free_space(void)
+{
+	return GATEWAY_AMEBA_USB_TX_RING_SIZE - gateway_usb_tx_count;
+}
+
+static int gateway_usb_tx_enqueue_bytes(const uint8_t *data, size_t len)
+{
+	size_t first_part;
+	size_t second_part;
+
+	if (data == NULL || len == 0u)
+		return 0;
+
+	taskENTER_CRITICAL();
+	if (len > gateway_usb_tx_free_space()) {
+		taskEXIT_CRITICAL();
+		++gateway_usb_stream_drop_count;
+		return -1;
+	}
+
+	first_part = len;
+	if (first_part > (GATEWAY_AMEBA_USB_TX_RING_SIZE - gateway_usb_tx_head))
+		first_part = GATEWAY_AMEBA_USB_TX_RING_SIZE - gateway_usb_tx_head;
+	second_part = len - first_part;
+
+	memcpy(gateway_usb_tx_ring + gateway_usb_tx_head, data, first_part);
+	if (second_part > 0u)
+		memcpy(gateway_usb_tx_ring, data + first_part, second_part);
+
+	gateway_usb_tx_head = (gateway_usb_tx_head + len) % GATEWAY_AMEBA_USB_TX_RING_SIZE;
+	gateway_usb_tx_count += len;
+	gateway_usb_last_ring_count = gateway_usb_tx_count;
+	gateway_usb_stream_bytes_enqueued += len;
+	taskEXIT_CRITICAL();
+	return 0;
+}
+
+static size_t gateway_usb_tx_dequeue_chunk(uint8_t *dest, size_t max_len)
+{
+	size_t len;
+	size_t first_part;
+	size_t second_part;
+
+	if (dest == NULL || max_len == 0u)
+		return 0u;
+
+	taskENTER_CRITICAL();
+	len = gateway_usb_tx_count;
+	if (len > max_len)
+		len = max_len;
+	if (len == 0u) {
+		taskEXIT_CRITICAL();
+		return 0u;
+	}
+
+	first_part = len;
+	if (first_part > (GATEWAY_AMEBA_USB_TX_RING_SIZE - gateway_usb_tx_tail))
+		first_part = GATEWAY_AMEBA_USB_TX_RING_SIZE - gateway_usb_tx_tail;
+	second_part = len - first_part;
+
+	memcpy(dest, gateway_usb_tx_ring + gateway_usb_tx_tail, first_part);
+	if (second_part > 0u)
+		memcpy(dest + first_part, gateway_usb_tx_ring, second_part);
+
+	gateway_usb_tx_tail = (gateway_usb_tx_tail + len) % GATEWAY_AMEBA_USB_TX_RING_SIZE;
+	gateway_usb_tx_count -= len;
+	gateway_usb_last_ring_count = gateway_usb_tx_count;
+	gateway_usb_stream_bytes_sent += len;
+	taskEXIT_CRITICAL();
+	return len;
+}
+
+static int gateway_usb_enqueue_init_packet(void)
+{
+	gateway_proto_init_info_t init_info;
+	uint8_t init_buf[GATEWAY_PROTO_INIT_SIZE];
+
+	if (gateway_usb_proto_init_sent)
+		return 0;
+
+	gateway_proto_default_init(&init_info);
+	if (gateway_proto_write_init(init_buf, &init_info) != 0)
+		return -1;
+	if (gateway_usb_tx_enqueue_bytes(init_buf, sizeof(init_buf)) != 0)
+		return -1;
+	gateway_usb_proto_init_sent = 1;
+	return 0;
+}
+
+static int gateway_usb_enqueue_media_packet(uint8_t stream_id, uint32_t seq_no,
+					    const uint8_t *payload, size_t payload_len)
+{
+	gateway_proto_media_info_t media_info;
+	uint8_t header[GATEWAY_PROTO_PACKET_HEADER_SIZE];
+
+	media_info.stream_id = stream_id;
+	media_info.flags = stream_id == GATEWAY_PROTO_STREAM_VIDEO ?
+		gateway_video_flags(payload, payload_len) : 0u;
+	media_info.seq_no = seq_no;
+	media_info.payload_len = (uint32_t)payload_len;
+
+	if (gateway_proto_write_media_header(header, &media_info) != 0)
+		return -1;
+	if (gateway_usb_tx_enqueue_bytes(header, sizeof(header)) != 0)
+		return -1;
+	if (payload_len > 0u && gateway_usb_tx_enqueue_bytes(payload, payload_len) != 0)
+		return -1;
+	return 0;
+}
 
 static void gateway_usb_try_force_configure(void)
 {
@@ -217,16 +859,41 @@ static void gateway_usb_try_force_configure(void)
 }
 
 static int gateway_usb_queue_out_request(gateway_usb_function_ctx_t *ctx);
+static int gateway_usb_kick_tx(gateway_usb_function_ctx_t *ctx);
+
+static void gateway_usb_fifo_flush(struct usb_ep *ep, const char *reason)
+{
+	if (ep == NULL || ep->ops == NULL || ep->ops->fifo_flush == NULL)
+		return;
+
+	ep->ops->fifo_flush(ep);
+	++gateway_usb_fifo_flush_count;
+	printf("[gateway][usb] fifo_flush ep=%s reason=%s count=%lu\r\n",
+	       ep->name != NULL ? ep->name : "<na>",
+	       reason != NULL ? reason : "<na>",
+	       gateway_usb_fifo_flush_count);
+}
 
 static void gateway_usb_in_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	(void)ep;
 
+	++gateway_usb_in_complete_count;
 	gateway_usb_ctx.in_busy = 0;
 	if (req != NULL && req->status != 0) {
+		if (gateway_usb_stream_resetting) {
+			gateway_usb_stream_resetting = 0;
+			printf("[gateway][usb] bulk IN reset completion status=%d actual=%u\r\n",
+			       req->status, req->actual);
+			return;
+		}
+		++gateway_usb_in_error_count;
 		printf("[gateway][usb] bulk IN complete status=%d actual=%u\r\n",
 		       req->status, req->actual);
+		gateway_usb_reset_stream_session(&gateway_usb_ctx, "in-complete-error");
+		return;
 	}
+	(void)gateway_usb_kick_tx(&gateway_usb_ctx);
 }
 
 static int gateway_usb_send_pong(gateway_usb_function_ctx_t *ctx, u32 seq_no)
@@ -240,7 +907,7 @@ static int gateway_usb_send_pong(gateway_usb_function_ctx_t *ctx, u32 seq_no)
 		return -1;
 	}
 
-	memset(ctx->in_buf, 0, GATEWAY_AMEBA_USB_PACKET_SIZE);
+	memset(ctx->in_buf, 0, GATEWAY_AMEBA_USB_IN_CHUNK_SIZE);
 	pong = (gateway_usb_ping_packet_t *)ctx->in_buf;
 	memcpy(pong->magic, "PONG", sizeof(pong->magic));
 	pong->seq_no = seq_no;
@@ -249,7 +916,7 @@ static int gateway_usb_send_pong(gateway_usb_function_ctx_t *ctx, u32 seq_no)
 
 	ctx->in_req->buf = ctx->in_buf;
 	ctx->in_req->dma = (dma_addr_t)ctx->in_buf;
-	ctx->in_req->length = GATEWAY_AMEBA_USB_PACKET_SIZE;
+	ctx->in_req->length = sizeof(*pong);
 	ctx->in_req->actual = 0;
 	ctx->in_req->status = 0;
 	ctx->in_req->zero = 0;
@@ -267,6 +934,75 @@ static int gateway_usb_send_pong(gateway_usb_function_ctx_t *ctx, u32 seq_no)
 	       (unsigned long)seq_no,
 	       gateway_usb_tx_packets);
 	return 0;
+}
+
+static void gateway_usb_reset_stream_session(gateway_usb_function_ctx_t *ctx, const char *reason)
+{
+	int rc = 0;
+
+	if (ctx == NULL || ctx->in_ep == NULL || ctx->in_req == NULL)
+		return;
+
+	if (ctx->in_busy) {
+		gateway_usb_stream_resetting = 1;
+		rc = usb_ep_dequeue(ctx->in_ep, ctx->in_req);
+		printf("[gateway][usb] dequeue IN rc=%d reason=%s\r\n", rc,
+		       reason != NULL ? reason : "<na>");
+		if (rc != 0)
+			gateway_usb_stream_resetting = 0;
+	} else {
+		gateway_usb_stream_resetting = 0;
+	}
+	ctx->in_busy = 0;
+	gateway_usb_fifo_flush(ctx->in_ep, reason);
+	gateway_usb_tx_reset();
+	gateway_usb_last_kick_rc = rc;
+}
+
+static int gateway_usb_kick_tx(gateway_usb_function_ctx_t *ctx)
+{
+	size_t chunk_len;
+	int rc;
+
+	if (ctx == NULL || ctx->in_ep == NULL || ctx->in_req == NULL ||
+	    !ctx->configured || ctx->in_busy)
+		return 0;
+
+	chunk_len = gateway_usb_tx_dequeue_chunk(ctx->in_buf, GATEWAY_AMEBA_USB_IN_CHUNK_SIZE);
+	if (chunk_len == 0u)
+		return 0;
+
+	ctx->in_req->buf = ctx->in_buf;
+	ctx->in_req->dma = (dma_addr_t)ctx->in_buf;
+	ctx->in_req->length = chunk_len;
+	ctx->in_req->actual = 0;
+	ctx->in_req->status = 0;
+	ctx->in_req->zero = 0;
+	ctx->in_busy = 1;
+	gateway_usb_last_queue_len = chunk_len;
+	++gateway_usb_stream_kick_count;
+
+	rc = usb_ep_queue(ctx->in_ep, ctx->in_req, 0);
+	if (rc != 0) {
+		ctx->in_busy = 0;
+		printf("[gateway][usb] failed to queue stream IN rc=%d\r\n", rc);
+		gateway_usb_last_kick_rc = rc;
+		return -1;
+	}
+
+	gateway_usb_last_kick_rc = 0;
+	return 0;
+}
+
+static void gateway_usb_retry_init_if_needed(void)
+{
+	if (!gateway_usb_started || !gateway_usb_configured)
+		return;
+	if (!gateway_usb_host_ready)
+		return;
+
+	if (gateway_usb_enqueue_init_packet() == 0)
+		(void)gateway_usb_kick_tx(&gateway_usb_ctx);
 }
 
 static void gateway_usb_out_complete(struct usb_ep *ep, struct usb_request *req)
@@ -289,10 +1025,11 @@ static void gateway_usb_out_complete(struct usb_ep *ep, struct usb_request *req)
 	}
 
 	++gateway_usb_rx_packets;
+	gateway_usb_host_ready = 1;
 	gateway_usb_last_actual = req->actual;
 	gateway_usb_last_req_buf_addr = (unsigned long)req->buf;
 	gateway_usb_last_ctx_buf_addr = (unsigned long)ctx->out_buf;
-	dcache_invalidate_by_addr((uint32_t *)ctx->out_buf, GATEWAY_AMEBA_USB_PACKET_SIZE);
+	dcache_invalidate_by_addr((uint32_t *)ctx->out_buf, GATEWAY_AMEBA_USB_OUT_PACKET_SIZE);
 
 	for (i = 0; i < sizeof(gateway_usb_last_req_dump); ++i) {
 		if (req->buf != NULL && i < req->actual) {
@@ -326,11 +1063,14 @@ static void gateway_usb_out_complete(struct usb_ep *ep, struct usb_request *req)
 	gateway_usb_last_payload_len = ping->payload_len;
 	if (memcmp(ping->magic, "PING", sizeof(ping->magic)) == 0) {
 		gateway_usb_last_ping_valid = 1;
+		gateway_usb_reset_stream_session(ctx, "startup-ping");
 	} else {
 		/* For bring-up, prove bulk IN works even if the received payload is not decoded yet. */
 		gateway_usb_last_ping_valid = 2;
 	}
 	(void)gateway_usb_send_pong(ctx, ping->seq_no);
+	if (gateway_usb_enqueue_init_packet() == 0)
+		(void)gateway_usb_kick_tx(ctx);
 
 	(void)gateway_usb_queue_out_request(ctx);
 }
@@ -343,10 +1083,10 @@ static int gateway_usb_queue_out_request(gateway_usb_function_ctx_t *ctx)
 		return -1;
 	}
 
-	memset(ctx->out_buf, 0, GATEWAY_AMEBA_USB_PACKET_SIZE);
+	memset(ctx->out_buf, 0, GATEWAY_AMEBA_USB_OUT_PACKET_SIZE);
 	ctx->out_req->buf = ctx->out_buf;
 	ctx->out_req->dma = (dma_addr_t)ctx->out_buf;
-	ctx->out_req->length = GATEWAY_AMEBA_USB_PACKET_SIZE;
+	ctx->out_req->length = GATEWAY_AMEBA_USB_OUT_PACKET_SIZE;
 	ctx->out_req->actual = 0;
 	ctx->out_req->status = 0;
 	ctx->out_req->short_not_ok = 0;
@@ -401,6 +1141,7 @@ static void gateway_usb_function_disable(struct usb_function *function)
 	gateway_usb_configured = 0;
 	ctx->configured = 0;
 	ctx->in_busy = 0;
+	gateway_usb_tx_reset();
 	if (ctx->in_ep != NULL) {
 		usb_ep_disable(ctx->in_ep);
 	}
@@ -473,11 +1214,17 @@ static int gateway_usb_function_set_alt(struct usb_function *function,
 	ctx->out_req->dma = (dma_addr_t)ctx->out_buf;
 	ctx->configured = 1;
 	ctx->in_busy = 0;
+	gateway_usb_host_ready = 0;
 	gateway_usb_configured = 1;
+	gateway_usb_tx_reset();
 
 	printf("[gateway][usb] configured interface=%u alt=%u speed=%d\r\n",
 	       interface, alt, speed);
-	return gateway_usb_queue_out_request(ctx);
+	rc = gateway_usb_queue_out_request(ctx);
+	if (rc != 0)
+		return rc;
+
+	return 0;
 }
 
 static int gateway_usb_function_get_alt(struct usb_function *function, unsigned interface)
@@ -530,6 +1277,7 @@ static void gateway_usb_disconnect(struct usb_composite_dev *cdev)
 	gateway_usb_configured = 0;
 	gateway_usb_ctx.configured = 0;
 	gateway_usb_ctx.in_busy = 0;
+	gateway_usb_tx_reset();
 	printf("[gateway][usb] disconnected\r\n");
 }
 
@@ -539,6 +1287,7 @@ static void gateway_usb_suspend(struct usb_composite_dev *cdev)
 	gateway_usb_configured = 0;
 	gateway_usb_ctx.configured = 0;
 	gateway_usb_ctx.in_busy = 0;
+	gateway_usb_tx_reset();
 	printf("[gateway][usb] suspended\r\n");
 }
 
@@ -756,10 +1505,25 @@ static void gateway_ameba_task(void *param)
 {
 	unsigned long heartbeat_counter = 0;
 	TickType_t last_heartbeat_tick;
+	TickType_t next_upstream_retry_tick = 0;
+	TickType_t usb_progress_tick = 0;
 	int wifi_rc = 0;
+	unsigned long last_sent_observed = 0;
+	unsigned long last_in_done_observed = 0;
 
 	(void)param;
 	gateway_task_running = 1;
+	gateway_upstream_close(&gateway_upstream);
+	gateway_upstream_last_rc = -999;
+	gateway_upstream_connect_started = 0;
+	gateway_upstream_connected = 0;
+	gateway_upstream_connect_attempts = 0;
+	gateway_upstream_text_frames = 0;
+	gateway_upstream_binary_frames = 0;
+	gateway_upstream_close_frames = 0;
+	gateway_upstream_last_opcode = 0;
+	gateway_upstream_last_payload_len = 0;
+	gateway_upstream_last_attempt_tick = 0;
 
 	dbg_printf("\r\n[gateway] AmebaPro gateway firmware booted\r\n");
 	dbg_printf("[gateway] UART log is alive\r\n");
@@ -803,6 +1567,10 @@ static void gateway_ameba_task(void *param)
 	printf("[gateway][printf] USB disabled for pristine Wi-Fi integration stage\r\n");
 #endif
 	last_heartbeat_tick = xTaskGetTickCount();
+	next_upstream_retry_tick = last_heartbeat_tick;
+	usb_progress_tick = last_heartbeat_tick;
+	last_sent_observed = gateway_usb_stream_bytes_sent;
+	last_in_done_observed = gateway_usb_in_complete_count;
 
 	for (;;) {
 #if GATEWAY_AMEBA_ASSUME_WIFI_SAMPLE
@@ -816,17 +1584,71 @@ static void gateway_ameba_task(void *param)
 #endif
 #if GATEWAY_AMEBA_ENABLE_USB
 		gateway_usb_try_force_configure();
+		gateway_usb_retry_init_if_needed();
+		if (gateway_usb_ctx.in_busy) {
+			if (gateway_usb_stream_bytes_sent != last_sent_observed ||
+			    gateway_usb_in_complete_count != last_in_done_observed) {
+				last_sent_observed = gateway_usb_stream_bytes_sent;
+				last_in_done_observed = gateway_usb_in_complete_count;
+				usb_progress_tick = xTaskGetTickCount();
+			} else if ((xTaskGetTickCount() - usb_progress_tick) >=
+				   pdMS_TO_TICKS(GATEWAY_AMEBA_USB_STALL_TIMEOUT_MS)) {
+				++gateway_usb_watchdog_reset_count;
+				printf("[gateway][usb] watchdog reset count=%lu sent=%lu in_done=%lu ring=%lu\r\n",
+				       gateway_usb_watchdog_reset_count,
+				       gateway_usb_stream_bytes_sent,
+				       gateway_usb_in_complete_count,
+				       (unsigned long)gateway_usb_last_ring_count);
+				gateway_usb_reset_stream_session(&gateway_usb_ctx, "in-stall-watchdog");
+				usb_progress_tick = xTaskGetTickCount();
+				last_sent_observed = gateway_usb_stream_bytes_sent;
+				last_in_done_observed = gateway_usb_in_complete_count;
+			}
+		} else {
+			usb_progress_tick = xTaskGetTickCount();
+			last_sent_observed = gateway_usb_stream_bytes_sent;
+			last_in_done_observed = gateway_usb_in_complete_count;
+		}
 #endif
+		if (gateway_wifi_connected && gateway_wifi_dhcp_ready) {
+			TickType_t now = xTaskGetTickCount();
+
+			if (!gateway_upstream.connected &&
+			    (int32_t)(now - next_upstream_retry_tick) >= 0) {
+				gateway_upstream_last_rc = gateway_upstream_connect(&gateway_upstream);
+				next_upstream_retry_tick = now + pdMS_TO_TICKS(GATEWAY_AMEBA_UPSTREAM_RETRY_MS);
+			}
+			gateway_upstream_poll(&gateway_upstream);
+		}
 		if ((xTaskGetTickCount() - last_heartbeat_tick) >= pdMS_TO_TICKS(GATEWAY_AMEBA_HEARTBEAT_MS)) {
 			last_heartbeat_tick = xTaskGetTickCount();
-			printf("[gateway][printf] heartbeat counter=%lu wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_started=%d usb_cfg=%d\r\n",
+			printf("[gateway][printf] heartbeat counter=%lu wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_started=%d usb_cfg=%d host_ready=%d upstream_conn=%d upstream_rc=%d upstream_errno=%d bin=%lu txt=%lu proto_init=%d enq=%lu sent=%lu drop=%lu ring=%lu kick_rc=%d in_busy=%d in_done=%lu in_err=%lu flush=%lu wd=%lu kicks=%lu qlen=%lu\r\n",
 			       heartbeat_counter,
 			       gateway_wifi_connected,
 			       gateway_wifi_dhcp_ready,
 			       gateway_wifi_last_connect_rc,
 			       gateway_usb_started,
-			       gateway_usb_configured);
-			dbg_printf("[gateway] heartbeat counter=%lu tick=%lu heap=%lu wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_started=%d usb_cfg=%d rx=%lu tx=%lu\r\n",
+			       gateway_usb_configured,
+			       gateway_usb_host_ready,
+			       gateway_upstream_connected,
+			       gateway_upstream_last_rc,
+			       gateway_upstream_last_errno,
+			       gateway_upstream_binary_frames,
+			       gateway_upstream_text_frames,
+			       gateway_usb_proto_init_sent,
+			       gateway_usb_stream_bytes_enqueued,
+			       gateway_usb_stream_bytes_sent,
+			       gateway_usb_stream_drop_count,
+			       (unsigned long)gateway_usb_last_ring_count,
+			       gateway_usb_last_kick_rc,
+			       gateway_usb_ctx.in_busy,
+			       gateway_usb_in_complete_count,
+			       gateway_usb_in_error_count,
+			       gateway_usb_fifo_flush_count,
+			       gateway_usb_watchdog_reset_count,
+			       gateway_usb_stream_kick_count,
+			       gateway_usb_last_queue_len);
+			dbg_printf("[gateway] heartbeat counter=%lu tick=%lu heap=%lu wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_started=%d usb_cfg=%d host_ready=%d upstream_conn=%d upstream_rc=%d upstream_errno=%d attempts=%lu rx=%lu tx=%lu bin=%lu txt=%lu last_opcode=%lu last_len=%lu proto_init=%d enq=%lu sent=%lu drop=%lu ring=%lu kick_rc=%d in_busy=%d in_done=%lu in_err=%lu flush=%lu wd=%lu kicks=%lu qlen=%lu\r\n",
 				   heartbeat_counter++,
 				   (unsigned long)xTaskGetTickCount(),
 				   (unsigned long)xPortGetFreeHeapSize(),
@@ -835,8 +1657,30 @@ static void gateway_ameba_task(void *param)
 				   gateway_wifi_last_connect_rc,
 				   gateway_usb_started,
 				   gateway_usb_configured,
+				   gateway_usb_host_ready,
+				   gateway_upstream_connected,
+				   gateway_upstream_last_rc,
+				   gateway_upstream_last_errno,
+				   gateway_upstream_connect_attempts,
 				   gateway_usb_rx_packets,
-				   gateway_usb_tx_packets);
+				   gateway_usb_tx_packets,
+				   gateway_upstream_binary_frames,
+				   gateway_upstream_text_frames,
+				   gateway_upstream_last_opcode,
+				   gateway_upstream_last_payload_len,
+				   gateway_usb_proto_init_sent,
+				   gateway_usb_stream_bytes_enqueued,
+				   gateway_usb_stream_bytes_sent,
+				   gateway_usb_stream_drop_count,
+				   (unsigned long)gateway_usb_last_ring_count,
+				   gateway_usb_last_kick_rc,
+				   gateway_usb_ctx.in_busy,
+				   gateway_usb_in_complete_count,
+				   gateway_usb_in_error_count,
+				   gateway_usb_fifo_flush_count,
+				   gateway_usb_watchdog_reset_count,
+				   gateway_usb_stream_kick_count,
+				   gateway_usb_last_queue_len);
 			dbg_printf("[gateway][usbdbg] last_valid=%d actual=%lu magic=%02x %02x %02x %02x seq=%lu payload=%lu bytes=%02x %02x %02x %02x\r\n",
 				   gateway_usb_last_ping_valid,
 				   gateway_usb_last_actual,
@@ -877,6 +1721,7 @@ static void gateway_ameba_task(void *param)
 
 void example_gateway_ameba(void)
 {
+	gateway_ameba_register_atcmd();
 #if GATEWAY_AMEBA_DIAG_STAGE_MINIMAL
 	dbg_printf("[gateway][diag] staging minimal task only\r\n");
 	gateway_task_create_attempted = 1;
@@ -917,7 +1762,7 @@ void example_gateway_ameba(void)
 
 void gateway_ameba_log_status(void)
 {
-	printf("[gateway][printf] status tick=%lu heap=%lu task_attempted=%d task_created=%d task_running=%d task_rc=%d wifi_started=%d wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_start_attempted=%d usb_start_rc=%d usb_started=%d usb_cfg=%d rx=%lu tx=%lu ping_valid=%d actual=%lu\r\n",
+	printf("[gateway][printf] status tick=%lu heap=%lu task_attempted=%d task_created=%d task_running=%d task_rc=%d wifi_started=%d wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_start_attempted=%d usb_start_rc=%d usb_started=%d usb_cfg=%d host_ready=%d upstream_started=%d upstream_conn=%d upstream_rc=%d upstream_errno=%d upstream_attempts=%lu txt=%lu bin=%lu close=%lu last_opcode=%lu last_len=%lu rx=%lu tx=%lu ping_valid=%d actual=%lu proto_init=%d enq=%lu sent=%lu drop=%lu ring=%lu kick_rc=%d in_busy=%d in_done=%lu in_err=%lu flush=%lu wd=%lu kicks=%lu qlen=%lu\r\n",
 	       (unsigned long)xTaskGetTickCount(),
 	       (unsigned long)xPortGetFreeHeapSize(),
 	       gateway_task_create_attempted,
@@ -932,8 +1777,94 @@ void gateway_ameba_log_status(void)
 	       gateway_usb_start_rc,
 	       gateway_usb_started,
 	       gateway_usb_configured,
+	       gateway_usb_host_ready,
+	       gateway_upstream_connect_started,
+	       gateway_upstream_connected,
+	       gateway_upstream_last_rc,
+	       gateway_upstream_last_errno,
+	       gateway_upstream_connect_attempts,
+	       gateway_upstream_text_frames,
+	       gateway_upstream_binary_frames,
+	       gateway_upstream_close_frames,
+	       gateway_upstream_last_opcode,
+	       gateway_upstream_last_payload_len,
 	       gateway_usb_rx_packets,
 	       gateway_usb_tx_packets,
 	       gateway_usb_last_ping_valid,
-	       gateway_usb_last_actual);
+	       gateway_usb_last_actual,
+	       gateway_usb_proto_init_sent,
+	       gateway_usb_stream_bytes_enqueued,
+	       gateway_usb_stream_bytes_sent,
+	       gateway_usb_stream_drop_count,
+	       (unsigned long)gateway_usb_last_ring_count,
+	       gateway_usb_last_kick_rc,
+	       gateway_usb_ctx.in_busy,
+	       gateway_usb_in_complete_count,
+	       gateway_usb_in_error_count,
+	       gateway_usb_fifo_flush_count,
+	       gateway_usb_watchdog_reset_count,
+	       gateway_usb_stream_kick_count,
+	       gateway_usb_last_queue_len);
+}
+
+static void fATGS(void *arg)
+{
+	(void)arg;
+	AT_PRINTK("[ATGS] gateway status");
+	gateway_ameba_log_status();
+	AT_PRINTK("[ATGS] OK");
+}
+
+static void fATGSTAT(void *arg)
+{
+	(void)arg;
+	AT_PRINTK("[ATGSTAT] gateway status");
+	gateway_ameba_log_status();
+	AT_PRINTK("[ATGSTAT] OK");
+}
+
+static void fATGR(void *arg)
+{
+	(void)arg;
+	AT_PRINTK("[ATGR] OK");
+	sys_reset();
+}
+
+static void fATGX(void *arg)
+{
+	(void)arg;
+	AT_PRINTK("[ATGX] OK");
+	sys_reset();
+}
+
+static void fATGH(void *arg)
+{
+	(void)arg;
+	AT_PRINTK("[ATGH] gateway commands: ATGS, ATGSTAT, ATGI, ATGR, ATGX");
+	AT_PRINTK("[ATGH] OK");
+}
+
+static log_item_t gateway_at_items[] = {
+	{"ATGS", fATGS,},
+	{"ATGSTAT", fATGSTAT,},
+	{"ATGI", fATGS,},
+	{"ATGR", fATGR,},
+	{"ATGX", fATGX,},
+	{"ATGH", fATGH,},
+	{"\nATGS", fATGS,},
+	{"\nATGSTAT", fATGSTAT,},
+	{"\nATGI", fATGS,},
+	{"\nATGR", fATGR,},
+	{"\nATGX", fATGX,},
+	{"\nATGH", fATGH,},
+};
+
+void gateway_ameba_register_atcmd(void)
+{
+	if (gateway_atcmd_registered)
+		return;
+
+	log_service_add_table(gateway_at_items, sizeof(gateway_at_items) / sizeof(gateway_at_items[0]));
+	gateway_atcmd_registered = 1;
+	printf("[gateway][printf] UART AT commands registered: ATGS ATGSTAT ATGI ATGR ATGX ATGH\r\n");
 }

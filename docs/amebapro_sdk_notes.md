@@ -42,6 +42,41 @@ What it does:
 
 The WSL script is the preferred Ameba firmware build path for this workspace.
 
+## ImageTool Completion Rule
+
+When driving `Amebapro Image Tool v1.3`, do not decide completion from `Result=OK` alone.
+
+Use this order of checks:
+
+1. The `Download` button must first become disabled after the download starts.
+2. Wait until the `Download` button becomes enabled again.
+3. Progress must have been active during the run and later returned to idle.
+4. Only after the button returns enabled should you inspect the latest debug log tail.
+
+Important practical note:
+
+- after a successful download, the board immediately resets and starts the new firmware
+- once the download really finishes, the next action should be to switch from ImageTool monitoring to UART (`COM3`) monitoring
+- stale `Result=OK` or old `WORKER: complete` text can remain visible, so button state and progress are the primary completion signal
+
+## UART Control Commands
+
+The current firmware keeps the SDK AT command parser enabled on UART.
+
+Important note:
+
+- on the current image, `ATSR` is **not** a reset command
+- the active AT command set behaves like `ATVER_1`, where `ATSR` recovers OTA signature instead
+
+Custom gateway commands are added directly by `example_gateway_ameba.c`:
+
+- `ATGS`
+  - print the current gateway status line immediately
+- `ATGR`
+  - reset the board immediately by calling `sys_reset()`
+
+These commands are registered at runtime through `log_service_add_table(...)` when `example_gateway_ameba()` runs.
+
 Known current behavior of the WSL script:
 
 - `application.is.mk` may still return non-zero during the final `manipulate_images` / postbuild stage
@@ -654,6 +689,11 @@ Trying to force the firmware build through the Windows-side replacement toolchai
 - The file that matters for flashing is `application_is/flash_is.bin`
 - The desktop copy `C:\Users\hkt99\Desktop\flash_is.bin` is the handoff image for ImageTool
 - The final SDK postbuild stage may still crash, but if `flash_is.bin` already exists it is usually still usable
+- ImageTool will automatically reset the board and boot the newly flashed firmware as soon as download completes
+- Because of that auto-reset behavior, UART/USB validation should assume the board may already be running the new firmware immediately after a successful flash
+- In the current `Amebapro Image Tool v1.3`, reliable completion signals are:
+  - `labelResult = OK`
+  - debug log contains `WORKER: complete`
 
 ### 3. Wi-Fi on this board is not fundamentally broken
 
@@ -695,3 +735,42 @@ When something works, always keep:
 - the exact build path used
 
 That habit already saved time during the USB ping/pong bring-up and again during the Wi-Fi validation stage.
+
+### 7. Prefer custom gateway UART commands over ATSR
+
+The current firmware keeps the legacy AT parser behavior where:
+
+- `ATSR` is **not** a board reset
+- it triggers OTA-signature recovery instead
+
+For runtime control on the gateway firmware, prefer the custom gateway commands:
+
+- `ATGS`
+  - print the current gateway status line immediately
+- `ATGSTAT`
+  - status alias for `ATGS`
+- `ATGR`
+  - reset the board
+- `ATGX`
+  - reset alias for `ATGR`
+- `ATGH`
+  - print the available gateway UART commands
+
+These commands are registered early from the `high_load_memory_use` sample path, so they should be available before the gateway task fully comes up.
+
+In practice, `ATGX` is the preferred reset command for manual testing because it is less likely to be confused with existing SDK command names when UART output is noisy.
+
+### 8. Treat `diag-dump` as a stress tool, not a neutral observer
+
+`gateway_client --diag-dump` prints every packet to stderr. That is useful for framing/debug, but it also slows the Windows host reader enough to create backpressure on the USB stream.
+
+During USB relay tests:
+
+- `diag-dump` caused `drop` and `ring` to climb on the Ameba side
+- a normal continuously reading client (`gateway_client --transport usb`) kept:
+  - `ring=0`
+  - `in_busy=0`
+  - watchdog count stable
+  - `sent` / `in_done` advancing normally
+
+So if USB looks unhealthy only under `diag-dump`, do not immediately assume the firmware streaming path is broken. First retest with the normal playback client.
