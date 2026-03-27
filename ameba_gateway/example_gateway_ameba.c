@@ -606,6 +606,18 @@ static int gateway_wifi_has_ip(void)
 	return (ip[0] | ip[1] | ip[2] | ip[3]) != 0;
 }
 
+static int gateway_wifi_link_ready(void)
+{
+	rtw_wifi_setting_t setting;
+
+	memset(&setting, 0, sizeof(setting));
+	if (wifi_get_setting(WLAN0_NAME, &setting) != RTW_SUCCESS) {
+		return 0;
+	}
+
+	return setting.ssid[0] != '\0';
+}
+
 static void gateway_wifi_log_ip(const char *tag)
 {
 	unsigned char *ip = LwIP_GetIP(&xnetif[0]);
@@ -763,10 +775,12 @@ static void gateway_ameba_task(void *param)
 	printf("[gateway][printf] assuming SDK sample already started Wi-Fi/DHCP\r\n");
 	gateway_wifi_connect_started = 1;
 	gateway_wifi_last_connect_rc = RTW_SUCCESS;
-	if (gateway_wifi_has_ip()) {
+	if (gateway_wifi_link_ready()) {
 		gateway_wifi_connected = 1;
-		gateway_wifi_dhcp_ready = 1;
-		gateway_wifi_log_ip("sample baseline");
+		if (gateway_wifi_has_ip()) {
+			gateway_wifi_dhcp_ready = 1;
+			gateway_wifi_log_ip("sample baseline");
+		}
 	}
 	gateway_wifi_task_finished = 1;
 #else
@@ -792,8 +806,10 @@ static void gateway_ameba_task(void *param)
 
 	for (;;) {
 #if GATEWAY_AMEBA_ASSUME_WIFI_SAMPLE
-		if (!gateway_wifi_dhcp_ready && gateway_wifi_has_ip()) {
+		if (!gateway_wifi_connected && gateway_wifi_link_ready()) {
 			gateway_wifi_connected = 1;
+		}
+		if (gateway_wifi_connected && !gateway_wifi_dhcp_ready && gateway_wifi_has_ip()) {
 			gateway_wifi_dhcp_ready = 1;
 			gateway_wifi_log_ip("sample DHCP ready");
 		}

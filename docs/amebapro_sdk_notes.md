@@ -35,8 +35,8 @@ wsl -d Ubuntu-22.04 -u root -- bash /mnt/c/Users/hkt99/work/carplay_poc/scripts/
 What it does:
 
 - extracts the SDK Linux toolchain into `/root/ameba_toolchains` if needed
-- builds the current firmware project from:
-  - `.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE`
+- builds the current firmware project from the pristine SDK tree:
+  - `.scratch/pristine_20260325_2/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE`
 - copies the resulting image to:
   - `C:\Users\hkt99\Desktop\flash_is.bin`
 
@@ -53,9 +53,40 @@ Known current behavior of the WSL script:
 
 - SDK archive in repo:
   - `tools/sdk-ameba-v5.2g_gcc.tar.gz`
-- Extracted SDK root used in this workspace:
+- Local extracted SDK tree used earlier for Windows-side experiments:
   - `.local/sdk-ameba-v5.2g_gcc`
-- Firmware project we are building:
+- Pristine SDK tree now used as the firmware source of truth:
+  - `.scratch/pristine_20260325_2/sdk-ameba-v5.2g_gcc`
+- Firmware project now built by the WSL script:
+  - `.scratch/pristine_20260325_2/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE`
+
+Do not treat `.local` as the current Ameba firmware baseline anymore.
+It contains earlier bring-up experiments and is not the preferred root for new Wi-Fi work.
+
+## Current Milestone
+
+The current firmware milestone is:
+
+- WSL-built pristine SDK sample
+- real Wi-Fi link to `Kevins Home`
+- DHCP success
+- `example_gateway_ameba()` launched after a verified Wi-Fi link
+- gateway FreeRTOS task running
+- USB gadget started and configured
+
+Current desktop image:
+
+- `C:\Users\hkt99\Desktop\flash_is.bin`
+- SHA256:
+  - `5F2C1B30D629C37FE60EBBF5E9B4F5B653D49CD799A9FEF766A6DE6D14B38447`
+
+Expected UART signature for this milestone:
+
+- `Wi-Fi connected, starting DHCP`
+- `Interface 0 IP address : 192.168.1.53`
+- `Launching gateway integration task after IP ready`
+- `[gateway][printf] xTaskCreate ok rc=1`
+- `[gateway][printf] status ... wifi_started=1 wifi_conn=1 wifi_ip=1 ... usb_started=1 usb_cfg=1`
   - `.local/sdk-ameba-v5.2g_gcc/project/realtek_amebapro_v0_example/GCC-RELEASE`
 
 ## Gateway Firmware Hook
@@ -76,18 +107,19 @@ It is hooked into the SDK example framework through:
 The current `gateway` firmware image is being brought up in this order:
 
 1. `wlan_network()` in `main.c`
-2. `example_gateway_ameba()`
-3. `gateway_ameba_task()`
-4. `wifi_on(STA) -> wifi_connect() -> DHCP`
-5. USB bulk bring-up after Wi-Fi is ready or has at least attempted to connect
+2. pristine `high_load_memory_use` sample brings up STA
+3. sample verifies a real Wi-Fi link with `wifi_get_setting()`
+4. `example_gateway_ameba()`
+5. `gateway_ameba_task()`
+6. USB bulk bring-up after the verified Wi-Fi link is already up
 
-This is now aligned with the validated STA sample behavior:
+This is now aligned with the validated STA sample behavior and avoids stale-IP false positives:
 
 - let `wlan_network()` perform the normal SDK bring-up first
-- call `wifi_on(STA)` again from the gateway task if needed
-- call `wifi_connect()` with the local hotspot credentials
-- start DHCP
-- start USB after the Wi-Fi stage
+- let the sample own `wifi_connect()` and DHCP
+- only treat Wi-Fi as ready after `wifi_get_setting(WLAN0_NAME, ...)` reports a real SSID
+- only start `gateway` after that verified link is present
+- start USB after `gateway` starts
 
 The Wi-Fi STA credentials are still sourced from the local-only file:
 
@@ -134,6 +166,35 @@ Convenience copy used for flashing from Windows desktop:
 After each successful rebuild, copy the new `flash_is.bin` from the SDK output directory to the desktop copy.
 
 When using the WSL build script above, the desktop copy is updated automatically.
+
+## Wi-Fi Bring-Up Findings
+
+These findings were important to reach the current milestone:
+
+- `has_ip=1` alone is not enough to say Wi-Fi is connected.
+  - stale IP state like `192.168.1.80` can remain even when the driver reports `ssid = NULL, not connected`
+  - always check `wifi_get_setting(WLAN0_NAME, &setting)` and require a non-empty `setting.ssid`
+- scanning proved that the board could see `Kevins Home` but not `KeviniPhone`
+  - `Kevins Home` typically appeared on channel `1` with BSSID `6c:b1:58:ba:0a:49`
+- once `Kevins Home` allowed the board, the connection sequence became:
+  - `auth success`
+  - `association success`
+  - key install
+  - DHCP
+- the repeated `Stack overflow UsageFault` during WPA2 bring-up was not caused by the gateway task or USB.
+  - it came from running scan/retry/`wifi_connect()` inside the sample monitor task with only `256` words of stack
+  - increasing that task stack to `2048` fixed the crash and allowed the connection to complete
+
+Current sample setting:
+
+- file:
+  - `.scratch/pristine_20260325_2/sdk-ameba-v5.2g_gcc/component/common/example/high_load_memory_use/example_high_load_memory_use.c`
+- monitor task stack:
+  - `SAMPLE_MONITOR_STACK_SIZE 2048`
+- target SSID:
+  - `Kevins Home`
+- target password:
+  - `2828189028`
 
 ## Known-Good USB Baseline
 

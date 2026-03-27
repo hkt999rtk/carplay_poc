@@ -4,8 +4,10 @@
 #include <platform/platform_stdlib.h>
 #include <lwip_netconf.h>
 #include <lwip/sockets.h>
+#include "wifi_conf.h"
 #include "wifi_constants.h"
 #include "wifi_structures.h"
+#include "wifi_ind.h"
 #include "lwip_netconf.h"
 
 #if CONFIG_EXAMPLE_GATEWAY_AMEBA
@@ -29,6 +31,22 @@
 extern struct netif xnetif[NET_IF_NUM];
 
 #define PRIORITY_OFFSET		1
+#define SAMPLE_MONITOR_STACK_SIZE 2048
+#define SAMPLE_TARGET_SCAN_BUFLEN 512
+#define SAMPLE_CONNECT_RETRY_TICKS 5000
+#define SAMPLE_TARGET_SSID "Kevins Home"
+#define SAMPLE_TARGET_PASSWORD "2828189028"
+
+typedef struct sample_scan_info {
+	int attempted;
+	int rc;
+	int found;
+	s32 best_rssi;
+	u8 channel;
+	rtw_security_t security;
+	u8 bssid[6];
+	char ssid[33];
+} sample_scan_info_t;
 
 static void heap_monitor_handler(void *param);
 void ssl_client_thread(char *server_host);
@@ -37,10 +55,31 @@ static void udp_server_handler(void *param);
 static void udp_client_handler(void *param);
 static void sample_log_wifi_status(void);
 static void sample_maybe_start_gateway(void);
+static int sample_wifi_link_ready(void);
+static void sample_wifi_register_event_handlers(void);
+static void sample_wifi_event_connect_hdl(char *buf, int buf_len, int flags, void *handler_user_data);
+static void sample_wifi_event_disconnect_hdl(char *buf, int buf_len, int flags, void *handler_user_data);
+static void sample_wifi_event_handshake_hdl(char *buf, int buf_len, int flags, void *handler_user_data);
+static int sample_scan_target_result(char *buf, int buflen, char *target_ssid, void *user_data);
+static void sample_scan_named_ssid(sample_scan_info_t *info, const char *ssid);
+static void sample_attempt_wifi_connect(const char *reason);
 static volatile int sample_wifi_connect_attempted = 0;
 static volatile int sample_wifi_connect_ok = 0;
 static volatile int sample_gateway_hook_called = 0;
 static volatile int sample_gateway_hook_returned = 0;
+static volatile int sample_wifi_event_connect_count = 0;
+static volatile int sample_wifi_event_disconnect_count = 0;
+static volatile int sample_wifi_event_handshake_count = 0;
+static volatile unsigned long sample_wifi_retry_count = 0;
+static volatile unsigned long sample_wifi_last_attempt_tick = 0;
+static volatile int sample_wifi_event_connect_len = 0;
+static volatile int sample_wifi_event_disconnect_len = 0;
+static volatile int sample_wifi_event_handshake_len = 0;
+static unsigned char sample_wifi_event_connect_mac[6] = {0};
+static unsigned char sample_wifi_event_disconnect_mac[6] = {0};
+static char sample_wifi_event_handshake_msg[32] = {0};
+static sample_scan_info_t sample_scan_hotspot = {0};
+static sample_scan_info_t sample_scan_home = {0};
 
 /*
  * @brief  Memory usage for high-load use case.
@@ -60,7 +99,7 @@ static void high_load_case_memory_usage(void){
 	*	1. Start heap monitor thread	
 	**********************************************************************************/
 	// Start a thread that would check minimun available heap size periodically during the execution.
-	if(xTaskCreate(heap_monitor_handler, "heap_monitor_handler", 256,(void *) NULL, tskIDLE_PRIORITY + 1 + PRIORITY_OFFSET, NULL) != pdPASS)
+	if(xTaskCreate(heap_monitor_handler, "heap_monitor_handler", SAMPLE_MONITOR_STACK_SIZE, (void *) NULL, tskIDLE_PRIORITY + 1 + PRIORITY_OFFSET, NULL) != pdPASS)
 		printf("\r\nERROR: Create heap monitor task failed.");
 
 	
@@ -72,23 +111,16 @@ static void high_load_case_memory_usage(void){
 		printf("\n\rERROR: wifi_on failed\n");
 		return;
 	}
+	sample_wifi_register_event_handlers();
 	
 	
 	/**********************************************************************************
 	*	3. Connect to AP by WPA2-AES		
 	**********************************************************************************/	
 	// Connect to AP with PSK-WPA2-AES.
-	char *ssid = "KeviniPhone";
-	char *password = "2828189028";
-	sample_wifi_connect_attempted = 1;
-	if(wifi_connect(ssid, RTW_SECURITY_WPA2_AES_PSK, password, strlen(ssid), strlen(password), -1, NULL) == RTW_SUCCESS) {
-		sample_wifi_connect_ok = 1;
-		printf("\n\rWi-Fi connected, starting DHCP\n");
-		LwIP_DHCP(0, DHCP_START);
-	} else {
-		sample_wifi_connect_ok = -1;
-		printf("\n\rERROR: wifi_connect failed\n");
-	}
+	sample_scan_named_ssid(&sample_scan_hotspot, SAMPLE_TARGET_SSID);
+	sample_scan_named_ssid(&sample_scan_home, "KeviniPhone");
+	sample_attempt_wifi_connect("initial");
 
 	sample_maybe_start_gateway();
 
@@ -128,6 +160,13 @@ static void heap_monitor_handler(void *param){
 		int getHeap = xPortGetFreeHeapSize();
 		if(minHeap == 0 || minHeap > getHeap)
 			minHeap = getHeap;
+		if (!sample_wifi_link_ready()) {
+			unsigned long now = (unsigned long)xTaskGetTickCount();
+			if (sample_wifi_last_attempt_tick == 0 ||
+			    (now - sample_wifi_last_attempt_tick) >= SAMPLE_CONNECT_RETRY_TICKS) {
+				sample_attempt_wifi_connect("retry");
+			}
+		}
 		sample_maybe_start_gateway();
 		printf("\n\nMin Available Heap: %d\n", minHeap);
 		sample_log_wifi_status();
@@ -142,15 +181,26 @@ static void heap_monitor_handler(void *param){
 static void sample_log_wifi_status(void)
 {
 	unsigned char *ip = LwIP_GetIP(&xnetif[0]);
+	rtw_wifi_setting_t setting;
+	unsigned char bssid[6] = {0};
 	int has_ip = 0;
+	int has_link = 0;
+	int setting_rc = RTW_ERROR;
+	int bssid_rc = RTW_ERROR;
 
 	if (ip != NULL) {
 		has_ip = (ip[0] | ip[1] | ip[2] | ip[3]) != 0;
 	}
 
-	printf("[sample][wifi] tick=%lu has_ip=%d ip=%u.%u.%u.%u\r\n",
+	memset(&setting, 0, sizeof(setting));
+	setting_rc = wifi_get_setting(WLAN0_NAME, &setting);
+	bssid_rc = wifi_get_ap_bssid(bssid);
+	has_link = (setting_rc == RTW_SUCCESS && setting.ssid[0] != '\0');
+
+	printf("[sample][wifi] tick=%lu has_ip=%d has_link=%d ip=%u.%u.%u.%u\r\n",
 	       (unsigned long)xTaskGetTickCount(),
 	       has_ip,
+	       has_link,
 	       ip ? ip[0] : 0,
 	       ip ? ip[1] : 0,
 	       ip ? ip[2] : 0,
@@ -160,19 +210,55 @@ static void sample_log_wifi_status(void)
 	       sample_wifi_connect_ok,
 	       sample_gateway_hook_called,
 	       sample_gateway_hook_returned);
+	printf("[sample][retry] count=%lu last_attempt_tick=%lu\r\n",
+	       sample_wifi_retry_count,
+	       sample_wifi_last_attempt_tick);
+	printf("[sample][scan][Kevins Home] attempted=%d rc=%d found=%d ssid=%s channel=%u security=%d rssi=%d bssid=%02x:%02x:%02x:%02x:%02x:%02x\r\n",
+	       sample_scan_hotspot.attempted,
+	       sample_scan_hotspot.rc,
+	       sample_scan_hotspot.found,
+	       sample_scan_hotspot.ssid[0] ? sample_scan_hotspot.ssid : "<na>",
+	       (unsigned int)sample_scan_hotspot.channel,
+	       (int)sample_scan_hotspot.security,
+	       (int)sample_scan_hotspot.best_rssi,
+	       sample_scan_hotspot.bssid[0], sample_scan_hotspot.bssid[1], sample_scan_hotspot.bssid[2],
+	       sample_scan_hotspot.bssid[3], sample_scan_hotspot.bssid[4], sample_scan_hotspot.bssid[5]);
+	printf("[sample][scan][KeviniPhone] attempted=%d rc=%d found=%d ssid=%s channel=%u security=%d rssi=%d bssid=%02x:%02x:%02x:%02x:%02x:%02x\r\n",
+	       sample_scan_home.attempted,
+	       sample_scan_home.rc,
+	       sample_scan_home.found,
+	       sample_scan_home.ssid[0] ? sample_scan_home.ssid : "<na>",
+	       (unsigned int)sample_scan_home.channel,
+	       (int)sample_scan_home.security,
+	       (int)sample_scan_home.best_rssi,
+	       sample_scan_home.bssid[0], sample_scan_home.bssid[1], sample_scan_home.bssid[2],
+	       sample_scan_home.bssid[3], sample_scan_home.bssid[4], sample_scan_home.bssid[5]);
+	printf("[sample][event] connect=%d disconnect=%d handshake=%d\r\n",
+	       sample_wifi_event_connect_count,
+	       sample_wifi_event_disconnect_count,
+	       sample_wifi_event_handshake_count);
+	printf("[sample][event-detail] connect_len=%d mac=%02x:%02x:%02x:%02x:%02x:%02x disconnect_len=%d mac=%02x:%02x:%02x:%02x:%02x:%02x handshake_len=%d msg=%s\r\n",
+	       sample_wifi_event_connect_len,
+	       sample_wifi_event_connect_mac[0], sample_wifi_event_connect_mac[1], sample_wifi_event_connect_mac[2],
+	       sample_wifi_event_connect_mac[3], sample_wifi_event_connect_mac[4], sample_wifi_event_connect_mac[5],
+	       sample_wifi_event_disconnect_len,
+	       sample_wifi_event_disconnect_mac[0], sample_wifi_event_disconnect_mac[1], sample_wifi_event_disconnect_mac[2],
+	       sample_wifi_event_disconnect_mac[3], sample_wifi_event_disconnect_mac[4], sample_wifi_event_disconnect_mac[5],
+	       sample_wifi_event_handshake_len,
+	       sample_wifi_event_handshake_msg[0] ? sample_wifi_event_handshake_msg : "<na>");
+	printf("[sample][link] setting_rc=%d bssid_rc=%d ssid=%s channel=%u security=%d bssid=%02x:%02x:%02x:%02x:%02x:%02x\r\n",
+	       setting_rc,
+	       bssid_rc,
+	       (setting_rc == RTW_SUCCESS) ? (char *)setting.ssid : "<na>",
+	       (unsigned int)((setting_rc == RTW_SUCCESS) ? setting.channel : 0),
+	       (int)((setting_rc == RTW_SUCCESS) ? setting.security_type : -1),
+	       bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
 }
 
 static void sample_maybe_start_gateway(void)
 {
 #if CONFIG_EXAMPLE_GATEWAY_AMEBA
-	unsigned char *ip = LwIP_GetIP(&xnetif[0]);
-	int has_ip = 0;
-
-	if (ip != NULL) {
-		has_ip = (ip[0] | ip[1] | ip[2] | ip[3]) != 0;
-	}
-
-	if (!has_ip || sample_gateway_hook_called) {
+	if (!sample_wifi_link_ready() || sample_gateway_hook_called) {
 		return;
 	}
 
@@ -183,6 +269,180 @@ static void sample_maybe_start_gateway(void)
 	sample_gateway_hook_returned = 1;
 	printf("\n\r[gateway-hook] example_gateway_ameba() returned\n");
 #endif
+}
+
+static int sample_wifi_link_ready(void)
+{
+	rtw_wifi_setting_t setting;
+
+	memset(&setting, 0, sizeof(setting));
+	if (wifi_get_setting(WLAN0_NAME, &setting) != RTW_SUCCESS) {
+		return 0;
+	}
+
+	return setting.ssid[0] != '\0';
+}
+
+static void sample_wifi_register_event_handlers(void)
+{
+	wifi_reg_event_handler(WIFI_EVENT_CONNECT, sample_wifi_event_connect_hdl, NULL);
+	wifi_reg_event_handler(WIFI_EVENT_DISCONNECT, sample_wifi_event_disconnect_hdl, NULL);
+	wifi_reg_event_handler(WIFI_EVENT_FOURWAY_HANDSHAKE_DONE, sample_wifi_event_handshake_hdl, NULL);
+}
+
+static void sample_wifi_event_connect_hdl(char *buf, int buf_len, int flags, void *handler_user_data)
+{
+	(void)flags;
+	(void)handler_user_data;
+	sample_wifi_event_connect_count++;
+	sample_wifi_event_connect_len = buf_len;
+	memset(sample_wifi_event_connect_mac, 0, sizeof(sample_wifi_event_connect_mac));
+	if (buf != NULL && buf_len >= 6) {
+		memcpy(sample_wifi_event_connect_mac, buf, 6);
+	}
+}
+
+static void sample_wifi_event_disconnect_hdl(char *buf, int buf_len, int flags, void *handler_user_data)
+{
+	(void)flags;
+	(void)handler_user_data;
+	sample_wifi_event_disconnect_count++;
+	sample_wifi_event_disconnect_len = buf_len;
+	memset(sample_wifi_event_disconnect_mac, 0, sizeof(sample_wifi_event_disconnect_mac));
+	if (buf != NULL && buf_len >= 6) {
+		memcpy(sample_wifi_event_disconnect_mac, buf, 6);
+	}
+}
+
+static void sample_wifi_event_handshake_hdl(char *buf, int buf_len, int flags, void *handler_user_data)
+{
+	(void)flags;
+	(void)handler_user_data;
+	sample_wifi_event_handshake_count++;
+	sample_wifi_event_handshake_len = buf_len;
+	memset(sample_wifi_event_handshake_msg, 0, sizeof(sample_wifi_event_handshake_msg));
+	if (buf != NULL && buf_len > 0) {
+		int copy_len = buf_len;
+		if (copy_len >= (int)sizeof(sample_wifi_event_handshake_msg)) {
+			copy_len = (int)sizeof(sample_wifi_event_handshake_msg) - 1;
+		}
+		memcpy(sample_wifi_event_handshake_msg, buf, copy_len);
+	}
+}
+
+static int sample_scan_target_result(char *buf, int buflen, char *target_ssid, void *user_data)
+{
+	sample_scan_info_t *info = (sample_scan_info_t *)user_data;
+	u32 plen = 0;
+
+	while (plen < (u32)buflen) {
+		u32 len;
+		u32 ssid_len;
+		u32 security_mode;
+		rtw_security_t security_type = RTW_SECURITY_UNKNOWN;
+		s32 rssi;
+		u32 channel;
+		u8 *mac;
+		u8 *ssid;
+
+		len = (u8)*(buf + plen);
+		if (len == 0 || len == strlen(target_ssid)) {
+			break;
+		}
+
+		mac = (u8 *)(buf + plen + 1);
+		rssi = *(s32 *)(buf + plen + 1 + 6);
+		security_mode = (u8)*(buf + plen + 1 + 6 + 4);
+		switch (security_mode) {
+		case IW_ENCODE_ALG_NONE:
+			security_type = RTW_SECURITY_OPEN;
+			break;
+		case IW_ENCODE_ALG_WEP:
+			security_type = RTW_SECURITY_WEP_PSK;
+			break;
+		case IW_ENCODE_ALG_TKIP:
+			security_type = RTW_SECURITY_WPA_TKIP_PSK;
+			break;
+		case IW_ENCODE_ALG_CCMP:
+			security_type = RTW_SECURITY_WPA2_AES_PSK;
+			break;
+		default:
+			security_type = RTW_SECURITY_UNKNOWN;
+			break;
+		}
+		channel = *(buf + plen + 1 + 6 + 4 + 1 + 1);
+		ssid_len = len - 1 - 6 - 4 - 1 - 1 - 1;
+		ssid = (u8 *)(buf + plen + 1 + 6 + 4 + 1 + 1 + 1);
+		if (ssid_len > 32) {
+			ssid_len = 32;
+		}
+
+		if (ssid_len == strlen(target_ssid) && memcmp(ssid, target_ssid, ssid_len) == 0) {
+			info->found++;
+			if (info->found == 1 || rssi > info->best_rssi) {
+				memset(info->ssid, 0, sizeof(info->ssid));
+				memcpy(info->ssid, ssid, ssid_len);
+				memcpy(info->bssid, mac, 6);
+				info->best_rssi = rssi;
+				info->channel = (u8)channel;
+				info->security = security_type;
+			}
+		}
+
+		plen += len;
+	}
+
+	return 0;
+}
+
+static void sample_scan_named_ssid(sample_scan_info_t *info, const char *ssid)
+{
+	memset(info, 0, sizeof(*info));
+	info->attempted = 1;
+	info->best_rssi = -127;
+	info->rc = wifi_scan_networks_with_ssid(sample_scan_target_result,
+	                                        info,
+	                                        SAMPLE_TARGET_SCAN_BUFLEN,
+	                                        (char *)ssid,
+	                                        strlen(ssid));
+	printf("[sample][scan] request ssid=%s rc=%d found=%d best_rssi=%d channel=%u security=%d bssid=%02x:%02x:%02x:%02x:%02x:%02x\r\n",
+	       ssid,
+	       info->rc,
+	       info->found,
+	       (int)info->best_rssi,
+	       (unsigned int)info->channel,
+	       (int)info->security,
+	       info->bssid[0], info->bssid[1], info->bssid[2],
+	       info->bssid[3], info->bssid[4], info->bssid[5]);
+}
+
+static void sample_attempt_wifi_connect(const char *reason)
+{
+	sample_wifi_connect_attempted = 1;
+	sample_wifi_last_attempt_tick = (unsigned long)xTaskGetTickCount();
+	sample_wifi_retry_count++;
+
+	printf("\n\r[sample][retry] reason=%s count=%lu target=%s\r\n",
+	       reason,
+	       sample_wifi_retry_count,
+	       SAMPLE_TARGET_SSID);
+	sample_scan_named_ssid(&sample_scan_hotspot, SAMPLE_TARGET_SSID);
+	sample_scan_named_ssid(&sample_scan_home, "KeviniPhone");
+
+	if (wifi_connect(SAMPLE_TARGET_SSID,
+	                 RTW_SECURITY_WPA2_AES_PSK,
+	                 SAMPLE_TARGET_PASSWORD,
+	                 strlen(SAMPLE_TARGET_SSID),
+	                 strlen(SAMPLE_TARGET_PASSWORD),
+	                 -1,
+	                 NULL) == RTW_SUCCESS) {
+		sample_wifi_connect_ok = 1;
+		printf("\n\rWi-Fi connected, starting DHCP\n");
+		LwIP_DHCP(0, DHCP_START);
+	} else {
+		sample_wifi_connect_ok = -1;
+		printf("\n\rERROR: wifi_connect failed\n");
+	}
 }
 
 /*
