@@ -3,10 +3,23 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -21,25 +34,34 @@ extern "C" {
 #include "transport.h"
 }
 
-struct SharedVideoPacket {
+struct QueuedVideoPacket {
+	std::vector<uint8_t> packet;
+	bool keyframe = false;
+	uint32_t seq_no = 0;
+};
+
+struct SharedVideoState {
 	std::mutex lock;
 	std::vector<uint8_t> sps;
 	std::vector<uint8_t> pps;
-	std::vector<uint8_t> packet;
-	bool ready = false;
-	bool keyframe = false;
-	uint32_t seq_no = 0;
+	std::deque<QueuedVideoPacket> queue;
+	bool waiting_for_keyframe = true;
+	size_t dropped_packets = 0;
 };
 
 struct PlaybackState {
 	gateway_client_transport_t transport{};
 	SDL_AudioDeviceID audio_dev = 0;
 	std::atomic<bool> running{true};
-	SharedVideoPacket latest_video;
+	SharedVideoState video;
 	size_t audio_drop_threshold = 3200;
 	std::vector<uint8_t> usb_prefetch;
 	size_t usb_prefetch_off = 0;
 };
+
+static constexpr size_t kMaxQueuedVideoPackets = 8;
+static constexpr size_t kVideoCatchupThreshold = 6;
+static constexpr size_t kVideoDecodeBurst = 4;
 
 struct DecoderState {
 	AVCodecContext *codec_ctx = nullptr;
@@ -67,6 +89,24 @@ struct UsbStartupState {
 	std::vector<uint8_t> leftover;
 };
 
+struct UsbUpstreamConfigPacket {
+	char magic[4];
+	uint32_t seq_no;
+	uint16_t port;
+	uint16_t reserved;
+	char host[16];
+	char path[36];
+};
+static_assert(sizeof(UsbUpstreamConfigPacket) == 64,
+	      "UsbUpstreamConfigPacket must stay 64 bytes to match firmware");
+
+struct UsbUpstreamOptions {
+	bool enabled = true;
+	std::string host;
+	uint16_t port = 8081u;
+	std::string path = "/gateway";
+};
+
 static bool audio_output_enabled()
 {
 #ifdef _WIN32
@@ -91,7 +131,7 @@ static bool render_frame(DecoderState &state, AVFrame *frame)
 			return false;
 		}
 		state.renderer = SDL_CreateRenderer(state.window, -1,
-			SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+			SDL_RENDERER_ACCELERATED);
 		if (state.renderer == nullptr)
 			state.renderer = SDL_CreateRenderer(state.window, -1, SDL_RENDERER_SOFTWARE);
 		if (state.renderer == nullptr) {
@@ -280,6 +320,202 @@ static bool parse_int_arg(const char *text, int &out)
 	return true;
 }
 
+static void enqueue_video_packet(SharedVideoState &state, std::vector<uint8_t> &packet,
+				 bool keyframe, uint32_t seq_no)
+{
+	if (state.waiting_for_keyframe && !keyframe)
+		return;
+
+	if (keyframe)
+		state.waiting_for_keyframe = false;
+
+	if (state.queue.size() >= kMaxQueuedVideoPackets) {
+		state.dropped_packets += state.queue.size();
+		state.queue.clear();
+		state.waiting_for_keyframe = true;
+		if (!keyframe)
+			return;
+		state.waiting_for_keyframe = false;
+		fprintf(stderr,
+			"gateway_client: video queue overflow, dropped buffered packets and waiting for keyframe\n");
+	}
+
+	QueuedVideoPacket queued;
+	queued.packet.swap(packet);
+	queued.keyframe = keyframe;
+	queued.seq_no = seq_no;
+	state.queue.emplace_back(std::move(queued));
+}
+
+static void trim_video_queue_for_latency(SharedVideoState &state)
+{
+	if (state.queue.size() <= kVideoCatchupThreshold)
+		return;
+
+	size_t keep_from = state.queue.size();
+	for (size_t i = state.queue.size(); i > 0; --i) {
+		if (state.queue[i - 1].keyframe) {
+			keep_from = i - 1;
+			break;
+		}
+	}
+
+	if (keep_from >= state.queue.size()) {
+		state.dropped_packets += state.queue.size();
+		state.queue.clear();
+		state.waiting_for_keyframe = true;
+		fprintf(stderr,
+			"gateway_client: dropped queued video backlog, waiting for next keyframe\n");
+		return;
+	}
+
+	if (keep_from > 0) {
+		state.dropped_packets += keep_from;
+		state.queue.erase(state.queue.begin(), state.queue.begin() + (ptrdiff_t)keep_from);
+		fprintf(stderr,
+			"gateway_client: trimmed video backlog, kept latest keyframe seq=%u backlog=%zu\n",
+			(unsigned)state.queue.front().seq_no,
+			state.queue.size());
+	}
+}
+
+static bool detect_local_ipv4(std::string &out)
+{
+	char host_name[256];
+	bool success = false;
+#ifdef _WIN32
+	WSADATA wsa_data;
+	bool wsa_started = false;
+	SOCKET sock = INVALID_SOCKET;
+#else
+	int sock = -1;
+#endif
+
+	out.clear();
+#ifdef _WIN32
+	if (WSAStartup(MAKEWORD(2, 2), &wsa_data) == 0)
+		wsa_started = true;
+	else
+		return false;
+#endif
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (
+#ifdef _WIN32
+	    sock != INVALID_SOCKET
+#else
+	    sock >= 0
+#endif
+	) {
+		sockaddr_in remote{};
+		sockaddr_in local{};
+#ifdef _WIN32
+		int local_len = (int)sizeof(local);
+#else
+		socklen_t local_len = (socklen_t)sizeof(local);
+#endif
+		char addr_buf[INET_ADDRSTRLEN];
+
+		remote.sin_family = AF_INET;
+		remote.sin_port = htons(53);
+#ifdef _WIN32
+		if (InetPtonA(AF_INET, "1.1.1.1", &remote.sin_addr) == 1 &&
+		    connect(sock, (const sockaddr *)&remote, sizeof(remote)) == 0 &&
+		    getsockname(sock, (sockaddr *)&local, &local_len) == 0 &&
+		    InetNtopA(AF_INET, &local.sin_addr, addr_buf, sizeof(addr_buf)) != nullptr &&
+		    strcmp(addr_buf, "127.0.0.1") != 0) {
+#else
+		if (inet_pton(AF_INET, "1.1.1.1", &remote.sin_addr) == 1 &&
+		    connect(sock, (const sockaddr *)&remote, sizeof(remote)) == 0 &&
+		    getsockname(sock, (sockaddr *)&local, &local_len) == 0 &&
+		    inet_ntop(AF_INET, &local.sin_addr, addr_buf, sizeof(addr_buf)) != nullptr &&
+		    strcmp(addr_buf, "127.0.0.1") != 0) {
+#endif
+			out = addr_buf;
+			success = true;
+		}
+	}
+
+	if (!success && gethostname(host_name, sizeof(host_name)) == 0) {
+		addrinfo hints{};
+		addrinfo *result = nullptr;
+
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		if (getaddrinfo(host_name, nullptr, &hints, &result) == 0) {
+			for (addrinfo *it = result; it != nullptr; it = it->ai_next) {
+				const sockaddr_in *addr = (const sockaddr_in *)it->ai_addr;
+				char addr_buf[INET_ADDRSTRLEN];
+
+				if (addr == nullptr)
+					continue;
+#ifdef _WIN32
+				if (InetNtopA(AF_INET, &addr->sin_addr, addr_buf, sizeof(addr_buf)) == nullptr)
+#else
+				if (inet_ntop(AF_INET, &addr->sin_addr, addr_buf, sizeof(addr_buf)) == nullptr)
+#endif
+					continue;
+				if (strcmp(addr_buf, "127.0.0.1") == 0)
+					continue;
+				out = addr_buf;
+				success = true;
+				break;
+			}
+			freeaddrinfo(result);
+		}
+	}
+
+#ifdef _WIN32
+	if (sock != INVALID_SOCKET)
+		closesocket(sock);
+	if (wsa_started)
+		WSACleanup();
+#else
+	if (sock >= 0)
+		close(sock);
+#endif
+
+	return success;
+}
+
+static int send_usb_upstream_config(gateway_client_transport_t &transport, uint32_t seq_no,
+				    const UsbUpstreamOptions &options, const char *reason)
+{
+	UsbUpstreamConfigPacket packet{};
+	std::string host = options.host;
+
+	if (transport.kind != GATEWAY_CLIENT_TRANSPORT_USB || !options.enabled)
+		return 0;
+	if (host.empty() && !detect_local_ipv4(host)) {
+		fprintf(stderr,
+			"gateway_client: failed to detect local IPv4 for usb upstream config (%s)\n",
+			reason);
+		return -1;
+	}
+	if (host.size() >= sizeof(packet.host) || options.path.size() >= sizeof(packet.path)) {
+		fprintf(stderr,
+			"gateway_client: usb upstream config too long host=%zu path=%zu (%s)\n",
+			host.size(), options.path.size(), reason);
+		return -1;
+	}
+
+	memcpy(packet.magic, "CFG1", sizeof(packet.magic));
+	packet.seq_no = seq_no;
+	packet.port = options.port;
+	memcpy(packet.host, host.c_str(), host.size());
+	memcpy(packet.path, options.path.c_str(), options.path.size());
+
+	if (gateway_client_transport_write_all(&transport, &packet, sizeof(packet)) != 0) {
+		fprintf(stderr, "gateway_client: usb upstream config write failed (%s)\n", reason);
+		return -1;
+	}
+
+	fprintf(stderr,
+		"gateway_client: usb upstream config sent (%s) host=%s port=%u path=%s\n",
+		reason, host.c_str(), (unsigned)options.port, options.path.c_str());
+	return 0;
+}
+
 static int perform_usb_startup_handshake(gateway_client_transport_t &transport, uint32_t seq_no,
 					 const char *reason)
 {
@@ -315,7 +551,8 @@ static int perform_usb_startup_handshake(gateway_client_transport_t &transport, 
 }
 
 static int prepare_usb_stream_startup(gateway_client_transport_t &transport, uint32_t seq_no,
-				      const char *reason, UsbStartupState &startup)
+				      const char *reason, UsbStartupState &startup,
+				      const UsbUpstreamOptions &upstream_options)
 {
 	gateway_proto_init_info_t init_info{};
 	UsbPingPacket ping{};
@@ -354,6 +591,8 @@ static int prepare_usb_stream_startup(gateway_client_transport_t &transport, uin
 		fprintf(stderr, "gateway_client: usb startup flushed %d stale packets (%s)\n",
 			flush_count, reason);
 	}
+	if (send_usb_upstream_config(transport, seq_no, upstream_options, reason) != 0)
+		return -1;
 
 	memcpy(ping.magic, "PING", sizeof(ping.magic));
 	ping.seq_no = seq_no;
@@ -627,8 +866,14 @@ static int run_usb_ping_test(const gateway_client_transport_options_t &transport
 }
 
 static int run_diag_dump(const gateway_client_transport_options_t &transport_options,
-			 int diag_seconds, int diag_packets)
+			 int diag_seconds, int diag_packets,
+			 const UsbUpstreamOptions &upstream_options)
 {
+	auto now_ms = []() -> uint64_t {
+		using namespace std::chrono;
+		return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+	};
+
 	gateway_client_transport_t transport{};
 	UsbStartupState startup{};
 	gateway_proto_init_info_t init_info{};
@@ -636,6 +881,12 @@ static int run_diag_dump(const gateway_client_transport_options_t &transport_opt
 	std::thread watchdog;
 	int packets_dumped = 0;
 	size_t startup_off = 0;
+	uint64_t last_diag_resync_log_ms = 0;
+	unsigned diag_resync_suppressed = 0;
+	uint64_t last_diag_short_payload_log_ms = 0;
+	unsigned diag_short_payload_suppressed = 0;
+	uint64_t last_diag_payload_desync_log_ms = 0;
+	unsigned diag_payload_desync_suppressed = 0;
 
 	if (diag_seconds <= 0)
 		diag_seconds = 8;
@@ -648,9 +899,11 @@ static int run_diag_dump(const gateway_client_transport_options_t &transport_opt
 	}
 
 	if (transport_options.kind == GATEWAY_CLIENT_TRANSPORT_USB &&
-	    prepare_usb_stream_startup(transport, 0x2000u, "diag-open", startup) != 0) {
+	    prepare_usb_stream_startup(transport, 0x2000u, "diag-open", startup,
+				       upstream_options) != 0) {
 		fprintf(stderr, "gateway_client: retrying usb startup (diag-open)\n");
-		if (prepare_usb_stream_startup(transport, 0x2001u, "diag-open-retry", startup) != 0) {
+		if (prepare_usb_stream_startup(transport, 0x2001u, "diag-open-retry", startup,
+					       upstream_options) != 0) {
 			gateway_client_transport_close(&transport);
 			return 1;
 		}
@@ -689,9 +942,23 @@ static int run_diag_dump(const gateway_client_transport_options_t &transport_opt
 			return 1;
 		}
 		if (skipped > 0) {
-			fprintf(stderr,
-				"gateway_client: resynced diag init after skipping %d bytes\n",
-				skipped);
+			const uint64_t now = now_ms();
+			if (last_diag_resync_log_ms == 0 ||
+			    now - last_diag_resync_log_ms >= 5000) {
+				if (diag_resync_suppressed != 0) {
+					fprintf(stderr,
+						"gateway_client: resynced diag init after skipping %d bytes (suppressed=%u)\n",
+						skipped, diag_resync_suppressed);
+					diag_resync_suppressed = 0;
+				} else {
+					fprintf(stderr,
+						"gateway_client: resynced diag init after skipping %d bytes\n",
+						skipped);
+				}
+				last_diag_resync_log_ms = now;
+			} else {
+				++diag_resync_suppressed;
+			}
 		}
 	}
 	if (init_info.version == 0) {
@@ -726,28 +993,89 @@ static int run_diag_dump(const gateway_client_transport_options_t &transport_opt
 			break;
 		if (rc == 2 && saw_init) {
 			init_info = resync_init;
-			fprintf(stderr,
-				"gateway_client: resynced init during diag dump version=%u video=%u audio=%u skipped=%d\n",
-				(unsigned)init_info.version,
-				(unsigned)init_info.video_codec,
-				(unsigned)init_info.audio_codec,
-				skipped);
+			const uint64_t now = now_ms();
+			if (last_diag_resync_log_ms == 0 ||
+			    now - last_diag_resync_log_ms >= 5000) {
+				if (diag_resync_suppressed != 0) {
+					fprintf(stderr,
+						"gateway_client: resynced init during diag dump version=%u video=%u audio=%u skipped=%d (suppressed=%u)\n",
+						(unsigned)init_info.version,
+						(unsigned)init_info.video_codec,
+						(unsigned)init_info.audio_codec,
+						skipped,
+						diag_resync_suppressed);
+					diag_resync_suppressed = 0;
+				} else {
+					fprintf(stderr,
+						"gateway_client: resynced init during diag dump version=%u video=%u audio=%u skipped=%d\n",
+						(unsigned)init_info.version,
+						(unsigned)init_info.video_codec,
+						(unsigned)init_info.audio_codec,
+						skipped);
+				}
+				last_diag_resync_log_ms = now;
+			} else {
+				++diag_resync_suppressed;
+			}
 			continue;
 		}
 		if (skipped > 0) {
-			fprintf(stderr, "gateway_client: resynced media header after skipping %d bytes\n",
-				skipped);
+			const uint64_t now = now_ms();
+			if (last_diag_resync_log_ms == 0 ||
+			    now - last_diag_resync_log_ms >= 5000) {
+				if (diag_resync_suppressed != 0) {
+					fprintf(stderr,
+						"gateway_client: resynced media header after skipping %d bytes (suppressed=%u)\n",
+						skipped, diag_resync_suppressed);
+					diag_resync_suppressed = 0;
+				} else {
+					fprintf(stderr,
+						"gateway_client: resynced media header after skipping %d bytes\n",
+						skipped);
+				}
+				last_diag_resync_log_ms = now;
+			} else {
+				++diag_resync_suppressed;
+			}
 		}
 
 		rc = read_gateway_payload_resync(transport, &startup.leftover, &startup_off,
 						 payload, media_info.payload_len);
 		if (rc < 0) {
-			fprintf(stderr, "gateway_client: short payload during diag dump\n");
+			const uint64_t now = now_ms();
+			if (last_diag_short_payload_log_ms == 0 ||
+			    now - last_diag_short_payload_log_ms >= 5000) {
+				if (diag_short_payload_suppressed != 0) {
+					fprintf(stderr,
+						"gateway_client: short payload during diag dump (suppressed=%u)\n",
+						diag_short_payload_suppressed);
+					diag_short_payload_suppressed = 0;
+				} else {
+					fprintf(stderr, "gateway_client: short payload during diag dump\n");
+				}
+				last_diag_short_payload_log_ms = now;
+			} else {
+				++diag_short_payload_suppressed;
+			}
 			break;
 		}
 		if (rc == 0) {
-			fprintf(stderr,
-				"gateway_client: payload desync detected during diag dump, retrying header scan\n");
+			const uint64_t now = now_ms();
+			if (last_diag_payload_desync_log_ms == 0 ||
+			    now - last_diag_payload_desync_log_ms >= 5000) {
+				if (diag_payload_desync_suppressed != 0) {
+					fprintf(stderr,
+						"gateway_client: payload desync detected during diag dump, retrying header scan (suppressed=%u)\n",
+						diag_payload_desync_suppressed);
+					diag_payload_desync_suppressed = 0;
+				} else {
+					fprintf(stderr,
+						"gateway_client: payload desync detected during diag dump, retrying header scan\n");
+				}
+				last_diag_payload_desync_log_ms = now;
+			} else {
+				++diag_payload_desync_suppressed;
+			}
 			continue;
 		}
 
@@ -828,6 +1156,16 @@ static int run_raw_usb_probe(const gateway_client_transport_options_t &transport
 
 static void network_reader(PlaybackState *state)
 {
+	auto now_ms = []() -> uint64_t {
+		using namespace std::chrono;
+		return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+	};
+
+	uint64_t last_payload_desync_log_ms = 0;
+	unsigned payload_desync_suppressed = 0;
+	uint64_t last_resync_init_log_ms = 0;
+	unsigned resync_init_suppressed = 0;
+
 	while (state->running.load()) {
 		gateway_proto_media_info_t media_info;
 		gateway_proto_init_info_t resync_init{};
@@ -840,9 +1178,24 @@ static void network_reader(PlaybackState *state)
 		if (rc <= 0)
 			break;
 		if (rc == 2 && saw_init) {
-			fprintf(stderr,
-				"gateway_client: resynced init during playback version=%u skipped=%d\n",
-				(unsigned)resync_init.version, skipped);
+			const uint64_t now = now_ms();
+			if (last_resync_init_log_ms == 0 ||
+			    now - last_resync_init_log_ms >= 5000) {
+				if (resync_init_suppressed != 0) {
+					fprintf(stderr,
+						"gateway_client: resynced init during playback version=%u skipped=%d (suppressed=%u)\n",
+						(unsigned)resync_init.version, skipped,
+						resync_init_suppressed);
+					resync_init_suppressed = 0;
+				} else {
+					fprintf(stderr,
+						"gateway_client: resynced init during playback version=%u skipped=%d\n",
+						(unsigned)resync_init.version, skipped);
+				}
+				last_resync_init_log_ms = now;
+			} else {
+				++resync_init_suppressed;
+			}
 			continue;
 		}
 
@@ -852,38 +1205,44 @@ static void network_reader(PlaybackState *state)
 		if (rc < 0)
 			break;
 		if (rc == 0) {
-			fprintf(stderr, "gateway_client: payload desync detected during playback, resyncing\n");
+			const uint64_t now = now_ms();
+			if (last_payload_desync_log_ms == 0 ||
+			    now - last_payload_desync_log_ms >= 5000) {
+				if (payload_desync_suppressed != 0) {
+					fprintf(stderr,
+						"gateway_client: payload desync detected during playback, resyncing (suppressed=%u)\n",
+						payload_desync_suppressed);
+					payload_desync_suppressed = 0;
+				} else {
+					fprintf(stderr,
+						"gateway_client: payload desync detected during playback, resyncing\n");
+				}
+				last_payload_desync_log_ms = now;
+			} else {
+				++payload_desync_suppressed;
+			}
 			continue;
 		}
 
 		if (media_info.stream_id == GATEWAY_PROTO_STREAM_VIDEO) {
-			std::lock_guard<std::mutex> guard(state->latest_video.lock);
+			std::lock_guard<std::mutex> guard(state->video.lock);
 			uint8_t nal_type = h264_nal_type(payload);
 			if ((media_info.flags & GATEWAY_PROTO_FLAG_CONFIG) != 0) {
 				if (nal_type == 7)
-					state->latest_video.sps = payload;
+					state->video.sps = payload;
 				else if (nal_type == 8)
-					state->latest_video.pps = payload;
+					state->video.pps = payload;
 			} else {
 				std::vector<uint8_t> packet;
 				bool keyframe = (media_info.flags & GATEWAY_PROTO_FLAG_KEYFRAME) != 0;
 
 				if (keyframe) {
-					annexb_append(packet, state->latest_video.sps);
-					annexb_append(packet, state->latest_video.pps);
+					annexb_append(packet, state->video.sps);
+					annexb_append(packet, state->video.pps);
 				}
 				annexb_append(packet, payload);
-
-				if (state->latest_video.ready &&
-				    state->latest_video.keyframe &&
-				    !keyframe) {
-					continue;
-				}
-
-				state->latest_video.packet.swap(packet);
-				state->latest_video.seq_no = media_info.seq_no;
-				state->latest_video.keyframe = keyframe;
-				state->latest_video.ready = true;
+				enqueue_video_packet(state->video, packet, keyframe, media_info.seq_no);
+				trim_video_queue_for_latency(state->video);
 			}
 		} else if (media_info.stream_id == GATEWAY_PROTO_STREAM_AUDIO) {
 			if (audio_output_enabled() && state->audio_dev != 0) {
@@ -917,6 +1276,7 @@ int main(int argc, char **argv)
 	bool raw_usb_probe_mode = false;
 	int raw_usb_probe_reads = 4;
 	int raw_usb_probe_timeout_ms = 500;
+	UsbUpstreamOptions usb_upstream_options;
 
 	gateway_client_transport_options_default(&transport_options);
 
@@ -992,12 +1352,30 @@ int main(int argc, char **argv)
 				fprintf(stderr, "gateway_client: invalid raw usb timeout\n");
 				return 2;
 			}
+		} else if (strcmp(argv[i], "--upstream-host") == 0 && i + 1 < argc) {
+			usb_upstream_options.host = argv[++i];
+		} else if (strcmp(argv[i], "--upstream-port") == 0 && i + 1 < argc) {
+			if (!parse_u16_arg(argv[++i], usb_upstream_options.port) ||
+			    usb_upstream_options.port == 0) {
+				fprintf(stderr, "gateway_client: invalid upstream port\n");
+				return 2;
+			}
+		} else if (strcmp(argv[i], "--upstream-path") == 0 && i + 1 < argc) {
+			usb_upstream_options.path = argv[++i];
+			if (usb_upstream_options.path.empty()) {
+				fprintf(stderr, "gateway_client: invalid upstream path\n");
+				return 2;
+			}
+		} else if (strcmp(argv[i], "--no-usb-upstream-config") == 0) {
+			usb_upstream_options.enabled = false;
 		} else {
 			fprintf(stderr,
 				"usage: %s [--transport usb|tcp] [--host HOST] [--port N] "
 				"[--usb-vid VID] [--usb-pid PID] [--usb-poll-ms N] "
 				"[--usb-timeout-ms N] [--usb-ping] [--usb-ping-count N] "
 				"[--diag-dump] [--diag-seconds N] [--diag-packets N] "
+				"[--upstream-host IP] [--upstream-port N] [--upstream-path PATH] "
+				"[--no-usb-upstream-config] "
 				"[--raw-usb-probe] [--raw-usb-reads N] [--raw-usb-timeout-ms N]\n",
 				argv[0]);
 			return 2;
@@ -1017,7 +1395,8 @@ int main(int argc, char **argv)
 	if (diag_dump_mode) {
 		fprintf(stderr, "gateway_client: opening %s diag transport\n",
 			transport_options.kind == GATEWAY_CLIENT_TRANSPORT_USB ? "USB" : "TCP");
-		return run_diag_dump(transport_options, diag_seconds, diag_packets);
+		return run_diag_dump(transport_options, diag_seconds, diag_packets,
+				     usb_upstream_options);
 	}
 
 	if (raw_usb_probe_mode) {
@@ -1040,9 +1419,11 @@ int main(int argc, char **argv)
 	}
 
 	if (transport_options.kind == GATEWAY_CLIENT_TRANSPORT_USB &&
-	    prepare_usb_stream_startup(state.transport, 0x3000u, "playback-open", startup) != 0) {
+	    prepare_usb_stream_startup(state.transport, 0x3000u, "playback-open", startup,
+				       usb_upstream_options) != 0) {
 		fprintf(stderr, "gateway_client: retrying usb startup (playback-open)\n");
-		if (prepare_usb_stream_startup(state.transport, 0x3001u, "playback-open-retry", startup) != 0) {
+		if (prepare_usb_stream_startup(state.transport, 0x3001u, "playback-open-retry", startup,
+					       usb_upstream_options) != 0) {
 			gateway_client_transport_close(&state.transport);
 			return 1;
 		}
@@ -1099,8 +1480,7 @@ int main(int argc, char **argv)
 	reader_thread = std::thread(network_reader, &state);
 	while (state.running.load()) {
 		SDL_Event event;
-		std::vector<uint8_t> packet;
-		bool keyframe = false;
+		size_t decoded_this_round = 0;
 
 		while (SDL_PollEvent(&event)) {
 			if (event.type == SDL_QUIT) {
@@ -1109,28 +1489,41 @@ int main(int argc, char **argv)
 			}
 		}
 
-		{
-			std::lock_guard<std::mutex> guard(state.latest_video.lock);
-			if (state.latest_video.ready) {
-				packet.swap(state.latest_video.packet);
-				keyframe = state.latest_video.keyframe;
-				state.latest_video.ready = false;
-			}
-		}
+		while (state.running.load() && decoded_this_round < kVideoDecodeBurst) {
+			std::vector<uint8_t> packet;
+			bool keyframe = false;
+			uint32_t seq_no = 0;
 
-		if (!packet.empty()) {
+			{
+				std::lock_guard<std::mutex> guard(state.video.lock);
+				if (state.video.queue.empty())
+					break;
+				QueuedVideoPacket queued = std::move(state.video.queue.front());
+				state.video.queue.pop_front();
+				packet.swap(queued.packet);
+				keyframe = queued.keyframe;
+				seq_no = queued.seq_no;
+			}
+
 			if (!keyframe && !decoder.have_sync) {
-				SDL_Delay(1);
 				continue;
 			}
 			if (!decode_video_packet(decoder, packet, keyframe)) {
-				fprintf(stderr, "gateway_client: decode dropped, waiting for next keyframe\n");
+				fprintf(stderr,
+					"gateway_client: decode dropped at seq=%u, waiting for next keyframe\n",
+					(unsigned)seq_no);
 				decoder.have_sync = false;
 				avcodec_flush_buffers(decoder.codec_ctx);
+				std::lock_guard<std::mutex> guard(state.video.lock);
+				state.video.queue.clear();
+				state.video.waiting_for_keyframe = true;
+				break;
 			}
-		} else {
-			SDL_Delay(5);
+			++decoded_this_round;
 		}
+
+		if (decoded_this_round == 0)
+			SDL_Delay(1);
 	}
 
 	gateway_client_transport_request_stop(&state.transport);
