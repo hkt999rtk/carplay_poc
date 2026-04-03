@@ -1,6 +1,7 @@
 param(
     [string]$BuildPreset = "windows-ucrt64",
     [string]$PackageName = "carplay-poc-windows-binary-release",
+    [string]$DateStamp = "",
     [string]$MsysRoot = "C:\msys64",
     [string]$FirmwareImage = ""
 )
@@ -108,14 +109,21 @@ function Write-Checksums {
 }
 
 $repoRoot = Get-RepoRoot
+if ([string]::IsNullOrWhiteSpace($DateStamp)) {
+    $DateStamp = Get-Date -Format "yyyyMMdd"
+}
+if ([string]::IsNullOrWhiteSpace($PackageName)) {
+    throw "PackageName must not be empty"
+}
+$archiveBaseName = "$PackageName-$DateStamp"
 if ([string]::IsNullOrWhiteSpace($FirmwareImage)) {
     $desktop = [Environment]::GetFolderPath("Desktop")
     $FirmwareImage = Join-Path $desktop "flash_is.bin"
 }
 
 $distRoot = Join-Path $repoRoot "dist"
-$packageRoot = Join-Path $distRoot $PackageName
-$zipPath = Join-Path $distRoot ($PackageName + ".zip")
+$packageRoot = Join-Path $distRoot $archiveBaseName
+$zipPath = Join-Path $distRoot ($archiveBaseName + ".zip")
 $hostBinDir = Join-Path $packageRoot "host\bin"
 $hostTestDataDest = Join-Path $packageRoot "host\test_data"
 $firmwareDir = Join-Path $packageRoot "firmware"

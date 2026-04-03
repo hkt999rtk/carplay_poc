@@ -1,5 +1,6 @@
 param(
-    [string]$PackageName = "carplay-poc-source-release"
+    [string]$PackageName = "carplay-poc-source-release",
+    [string]$DateStamp = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,9 +82,16 @@ function Write-Checksums {
 }
 
 $repoRoot = Get-RepoRoot
+if ([string]::IsNullOrWhiteSpace($DateStamp)) {
+    $DateStamp = Get-Date -Format "yyyyMMdd"
+}
+if ([string]::IsNullOrWhiteSpace($PackageName)) {
+    throw "PackageName must not be empty"
+}
+$archiveBaseName = "$PackageName-$DateStamp"
 $distRoot = Join-Path $repoRoot "dist"
-$packageRoot = Join-Path $distRoot $PackageName
-$zipPath = Join-Path $distRoot ($PackageName + ".zip")
+$packageRoot = Join-Path $distRoot $archiveBaseName
+$zipPath = Join-Path $distRoot ($archiveBaseName + ".zip")
 $overlayRoot = Join-Path $packageRoot "firmware_overlay\pristine_20260325_2\sdk-ameba-v5.2g_gcc"
 $toolsDest = Join-Path $packageRoot "tools"
 $scriptsDest = Join-Path $packageRoot "scripts"
