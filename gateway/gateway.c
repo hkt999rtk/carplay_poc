@@ -59,6 +59,8 @@ static uint8_t gateway_video_flags(const uint8_t *payload, size_t payload_len)
 
 	if (payload == NULL || payload_len == 0u)
 		return 0;
+	if (payload_len >= 16u && memcmp(payload, "VFG1", 4) == 0)
+		return payload[4];
 	nal_type = (uint8_t)(payload[0] & 0x1Fu);
 	if (nal_type == 5u)
 		flags |= GATEWAY_PROTO_FLAG_KEYFRAME;

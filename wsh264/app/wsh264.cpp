@@ -17,6 +17,7 @@
 
 extern "C" {
 #include "base64.h"
+#include "gateway_proto.h"
 }
 
 static bitrate_ctrl_t b_ctrl;
@@ -48,10 +49,75 @@ typedef struct app_t_ {
 	pthread_t thread;
 	ws_cli_conn_t *conn; // bidirectional link
 	pthread_mutex_t crypto_lock;
+	pthread_mutex_t tx_lock;
+	pthread_mutex_t priority_lock;
+	pthread_cond_t priority_cond;
 	uint8_t session_nonce[CRYPTO_STREAM_NONCE_SIZE];
 	uint32_t media_seq;
+	uint32_t audio_chunk_index;
+	uint32_t video_frame_id;
+	unsigned int pending_audio_packets;
 	int crypto_init_sent;
 } app_t;
+
+#define VIDEO_FRAGMENT_DATA_SIZE (16u * 1024u)
+#define VIDEO_FRAGMENT_HEADER_SIZE 16u
+#define AUDIO_CHUNK_SIZE (8u * 1024u)
+#define AUDIO_BYTES_PER_SECOND 32000u
+
+static void write_u32le(uint8_t *out, uint32_t value)
+{
+	out[0] = (uint8_t)(value & 0xffu);
+	out[1] = (uint8_t)((value >> 8) & 0xffu);
+	out[2] = (uint8_t)((value >> 16) & 0xffu);
+	out[3] = (uint8_t)((value >> 24) & 0xffu);
+}
+
+static void write_u16le(uint8_t *out, uint16_t value)
+{
+	out[0] = (uint8_t)(value & 0xffu);
+	out[1] = (uint8_t)((value >> 8) & 0xffu);
+}
+
+static uint8_t video_payload_flags(const uint8_t *payload, size_t payload_len)
+{
+	uint8_t flags = 0;
+	uint8_t nal_type;
+
+	if (payload == NULL || payload_len == 0u)
+		return 0u;
+	nal_type = (uint8_t)(payload[0] & 0x1fu);
+	if (nal_type == 5u)
+		flags |= GATEWAY_PROTO_FLAG_KEYFRAME;
+	if (nal_type == 7u || nal_type == 8u)
+		flags |= GATEWAY_PROTO_FLAG_CONFIG;
+	return flags;
+}
+
+static void begin_audio_priority(app_t *app)
+{
+	pthread_mutex_lock(&app->priority_lock);
+	++app->pending_audio_packets;
+	pthread_cond_broadcast(&app->priority_cond);
+	pthread_mutex_unlock(&app->priority_lock);
+}
+
+static void end_audio_priority(app_t *app)
+{
+	pthread_mutex_lock(&app->priority_lock);
+	if (app->pending_audio_packets > 0u)
+		--app->pending_audio_packets;
+	pthread_cond_broadcast(&app->priority_cond);
+	pthread_mutex_unlock(&app->priority_lock);
+}
+
+static void wait_for_audio_priority(app_t *app)
+{
+	pthread_mutex_lock(&app->priority_lock);
+	while (app->pending_audio_packets > 0u)
+		pthread_cond_wait(&app->priority_cond, &app->priority_lock);
+	pthread_mutex_unlock(&app->priority_lock);
+}
 
 static int send_crypto_init_locked(app_t *app)
 {
@@ -102,16 +168,28 @@ static int send_encrypted_media(app_t *app, uint8_t stream_id,
 	if (app == NULL || payload == NULL)
 		return -1;
 
+	if (stream_id == CRYPTO_STREAM_ID_AUDIO)
+		begin_audio_priority(app);
+	else
+		wait_for_audio_priority(app);
+
 	packet_size = crypto_stream_packet_size(payload_len);
 	packet = (uint8_t *)malloc(packet_size);
-	if (packet == NULL)
+	if (packet == NULL) {
+		if (stream_id == CRYPTO_STREAM_ID_AUDIO)
+			end_audio_priority(app);
 		return -1;
+	}
 
+	pthread_mutex_lock(&app->tx_lock);
 	pthread_mutex_lock(&app->crypto_lock);
 	rc = send_crypto_init_locked(app);
 	seq_no = app->media_seq++;
 	pthread_mutex_unlock(&app->crypto_lock);
 	if (rc != 0) {
+		pthread_mutex_unlock(&app->tx_lock);
+		if (stream_id == CRYPTO_STREAM_ID_AUDIO)
+			end_audio_priority(app);
 		free(packet);
 		return -1;
 	}
@@ -120,13 +198,69 @@ static int send_encrypted_media(app_t *app, uint8_t stream_id,
 		packet, packet_size, stream_id, seq_no, app->session_nonce,
 		payload, payload_len);
 	if (encoded_size < 0) {
+		pthread_mutex_unlock(&app->tx_lock);
+		if (stream_id == CRYPTO_STREAM_ID_AUDIO)
+			end_audio_priority(app);
 		free(packet);
 		return -1;
 	}
 
 	rc = ws_sendframe(app->conn, (const char *)packet, (uint64_t)encoded_size, WS_FR_OP_BIN);
+	pthread_mutex_unlock(&app->tx_lock);
+	if (stream_id == CRYPTO_STREAM_ID_AUDIO)
+		end_audio_priority(app);
 	free(packet);
 	return rc;
+}
+
+static int send_video_media(app_t *app, const uint8_t *payload, size_t payload_len)
+{
+	uint8_t flags;
+	uint16_t frag_count;
+	uint16_t frag_index;
+	uint32_t frame_id;
+	size_t offset;
+
+	if (payload == NULL || payload_len == 0u)
+		return -1;
+
+	if (payload_len <= VIDEO_FRAGMENT_DATA_SIZE) {
+		return send_encrypted_media(app, CRYPTO_STREAM_ID_VIDEO, payload, payload_len);
+	}
+
+	flags = video_payload_flags(payload, payload_len);
+	frag_count = (uint16_t)((payload_len + VIDEO_FRAGMENT_DATA_SIZE - 1u) / VIDEO_FRAGMENT_DATA_SIZE);
+	frame_id = app->video_frame_id++;
+	offset = 0u;
+
+	for (frag_index = 0; frag_index < frag_count; ++frag_index) {
+		size_t frag_len = payload_len - offset;
+		uint8_t *packet;
+		int rc;
+
+		if (frag_len > VIDEO_FRAGMENT_DATA_SIZE)
+			frag_len = VIDEO_FRAGMENT_DATA_SIZE;
+		packet = (uint8_t *)malloc(VIDEO_FRAGMENT_HEADER_SIZE + frag_len);
+		if (packet == NULL)
+			return -1;
+
+		memcpy(packet, "VFG1", 4);
+		packet[4] = flags;
+		packet[5] = 0u;
+		write_u16le(packet + 6, frag_index);
+		write_u16le(packet + 8, frag_count);
+		write_u16le(packet + 10, 0u);
+		write_u32le(packet + 12, frame_id);
+		memcpy(packet + VIDEO_FRAGMENT_HEADER_SIZE, payload + offset, frag_len);
+		rc = send_encrypted_media(app, CRYPTO_STREAM_ID_VIDEO,
+					  packet, VIDEO_FRAGMENT_HEADER_SIZE + frag_len);
+		free(packet);
+		if (rc < 0)
+			return rc;
+		offset += frag_len;
+	}
+
+	return 0;
 }
 
 size_t check_size(uint8_t *start, size_t size)
@@ -322,18 +456,40 @@ void *audio_streaming(void *data) // 16k, 16bits, mono
 	app_t *app = (app_t *)data;
 	uint8_t *start = audio_bitstream;
 	int size = audio_bs_size;
-	int slice = 640;
+	size_t slice = AUDIO_CHUNK_SIZE;
 	int cursor = 0;
+
+	if (start == NULL || size <= 0)
+		pthread_exit(NULL);
+
 	for (;;) {
+		uint8_t *packet;
+		size_t packet_size;
+		size_t chunk_size;
+		useconds_t sleep_us;
+
 		if ((app->state & STATE_CLOSING_AUDIO) == STATE_CLOSING_AUDIO)
 			break;
 
-		if (cursor + slice > size) {
+		chunk_size = slice;
+		if ((size_t)size < chunk_size)
+			chunk_size = (size_t)size;
+		if (cursor + (int)chunk_size > size) {
 			cursor = 0;
 		}
-		send_encrypted_media(app, CRYPTO_STREAM_ID_AUDIO, &start[cursor], slice);
-		cursor += slice;
-		usleep(20000); // 10ms
+		packet_size = 12u + chunk_size;
+		packet = (uint8_t *)malloc(packet_size);
+		if (packet == NULL)
+			break;
+		memcpy(packet, "AUD0", 4);
+		write_u32le(packet + 4, app->audio_chunk_index++);
+		write_u32le(packet + 8, (uint32_t)cursor);
+		memcpy(packet + 12, &start[cursor], chunk_size);
+		send_encrypted_media(app, CRYPTO_STREAM_ID_AUDIO, packet, packet_size);
+		free(packet);
+		cursor += (int)chunk_size;
+		sleep_us = (useconds_t)(((uint64_t)chunk_size * 1000000ull) / AUDIO_BYTES_PER_SECOND);
+		usleep(sleep_us);
 	}
 	app->state &= (~STATE_STREAMING_AUDIO);
 	app->state &= (~STATE_CLOSING_AUDIO);
@@ -367,7 +523,7 @@ void *h264_streaming(void* data)
 		size -= ((chunk.start - start) + chunk.size);
 		start = chunk.start + chunk.size;;
 
-		send_encrypted_media(app, CRYPTO_STREAM_ID_VIDEO, chunk.start, chunk.size);
+		send_video_media(app, chunk.start, chunk.size);
 
 		int nal_type = *chunk.start & 0x1f;
 		if ((nal_type>=1) && (nal_type<=5)) {
@@ -641,6 +797,9 @@ static void onopen(ws_cli_conn_t *client)
 	app->state = STATE_IDLE;
 	crypto_stream_fill_random(app->session_nonce, sizeof(app->session_nonce));
 	pthread_mutex_init(&app->crypto_lock, NULL);
+	pthread_mutex_init(&app->tx_lock, NULL);
+	pthread_mutex_init(&app->priority_lock, NULL);
+	pthread_cond_init(&app->priority_cond, NULL);
 	printf("set user data ! %p\n", (void *)app);
 	set_userdata(client, app);
 	printf("set user data ok !\n");
@@ -657,6 +816,9 @@ void onclose(ws_cli_conn_t *client)
 	stop_audio_stream(client, NULL);
 
 	pthread_mutex_destroy(&app->crypto_lock);
+	pthread_mutex_destroy(&app->tx_lock);
+	pthread_cond_destroy(&app->priority_cond);
+	pthread_mutex_destroy(&app->priority_lock);
 	free(app);
 }
 

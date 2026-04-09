@@ -175,6 +175,10 @@ static int gateway_atcmd_registered = 0;
 static volatile unsigned long gateway_cpu_busy_pct = 0;
 static volatile unsigned long gateway_cpu_idle_pct = 0;
 static volatile unsigned long gateway_cpu_sample_ticks = 0;
+static unsigned long gateway_cpu_busy_history[10] = {0};
+static unsigned long gateway_cpu_history_sum = 0;
+static unsigned int gateway_cpu_history_index = 0;
+static unsigned int gateway_cpu_history_count = 0;
 
 extern struct netif xnetif[NET_IF_NUM];
 extern volatile uint32_t g_gateway_cpu_tick_total;
@@ -233,8 +237,15 @@ static void gateway_cpu_update_sample(void)
 	if (busy_pct > 100UL) {
 		busy_pct = 100UL;
 	}
-	gateway_cpu_busy_pct = busy_pct;
-	gateway_cpu_idle_pct = 100UL - busy_pct;
+	gateway_cpu_history_sum -= gateway_cpu_busy_history[gateway_cpu_history_index];
+	gateway_cpu_busy_history[gateway_cpu_history_index] = busy_pct;
+	gateway_cpu_history_sum += busy_pct;
+	gateway_cpu_history_index = (gateway_cpu_history_index + 1u) % 10u;
+	if (gateway_cpu_history_count < 10u) {
+		gateway_cpu_history_count++;
+	}
+	gateway_cpu_busy_pct = gateway_cpu_history_sum / gateway_cpu_history_count;
+	gateway_cpu_idle_pct = 100UL - gateway_cpu_busy_pct;
 }
 
 static void gateway_upstream_close(gateway_upstream_state_t *state)
@@ -794,6 +805,8 @@ static uint8_t gateway_video_flags(const uint8_t *payload, size_t payload_len)
 
 	if (payload == NULL || payload_len == 0u)
 		return 0;
+	if (payload_len >= 16u && memcmp(payload, "VFG1", 4) == 0)
+		return payload[4];
 	nal_type = (uint8_t)(payload[0] & 0x1Fu);
 	if (nal_type == 5u)
 		flags |= GATEWAY_PROTO_FLAG_KEYFRAME;
@@ -1738,7 +1751,6 @@ static void gateway_ameba_task(void *param)
 	gateway_upstream_config_t heartbeat_config;
 	int heartbeat_cfg_valid = 0;
 	const char *heartbeat_host = "<unset>";
-	const char *heartbeat_path = "<unset>";
 
 	(void)param;
 	gateway_task_running = 1;
@@ -1868,126 +1880,28 @@ static void gateway_ameba_task(void *param)
 			if (heartbeat_cfg_valid) {
 				if (heartbeat_config.host[0] != '\0')
 					heartbeat_host = heartbeat_config.host;
-				if (heartbeat_config.path[0] != '\0')
-					heartbeat_path = heartbeat_config.path;
 			}
-			printf("[gateway][printf] heartbeat counter=%lu cpu_busy=%lu cpu_idle=%lu cpu_ticks=%lu wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_started=%d usb_cfg=%d host_ready=%d upstream_cfg=%d cfg_seq=%lu cfg_host=%s cfg_port=%u cfg_path=%s upstream_conn=%d upstream_rc=%d upstream_errno=%d bin=%lu txt=%lu proto_init=%d enq=%lu sent=%lu drop=%lu ring=%lu kick_rc=%d in_busy=%d in_done=%lu in_err=%lu flush=%lu wd=%lu kicks=%lu qlen=%lu last_valid=%d magic=%02x%02x%02x%02x\r\n",
+			printf("[gateway] heartbeat counter=%lu cpu_busy=%lu cpu_idle=%lu cpu_ticks=%lu wifi_conn=%d wifi_ip=%d usb_cfg=%d host_ready=%d upstream_cfg=%d cfg_host=%s cfg_port=%u upstream_conn=%d proto_init=%d enq=%lu sent=%lu drop=%lu ring=%lu in_done=%lu wd=%lu\r\n",
 			       heartbeat_counter,
 			       gateway_cpu_busy_pct,
 			       gateway_cpu_idle_pct,
 			       gateway_cpu_sample_ticks,
 			       gateway_wifi_connected,
 			       gateway_wifi_dhcp_ready,
-			       gateway_wifi_last_connect_rc,
-			       gateway_usb_started,
 			       gateway_usb_configured,
 			       gateway_usb_host_ready,
 			       heartbeat_cfg_valid,
-			       (unsigned long)heartbeat_config.seq_no,
 			       heartbeat_host,
 			       (unsigned)heartbeat_config.port,
-			       heartbeat_path,
 			       gateway_upstream_connected,
-			       gateway_upstream_last_rc,
-			       gateway_upstream_last_errno,
-			       gateway_upstream_binary_frames,
-			       gateway_upstream_text_frames,
 			       gateway_usb_proto_init_sent,
 			       gateway_usb_stream_bytes_enqueued,
 			       gateway_usb_stream_bytes_sent,
 			       gateway_usb_stream_drop_count,
 			       (unsigned long)gateway_usb_last_ring_count,
-			       gateway_usb_last_kick_rc,
-			       gateway_usb_ctx.in_busy,
 			       gateway_usb_in_complete_count,
-			       gateway_usb_in_error_count,
-			       gateway_usb_fifo_flush_count,
-			       gateway_usb_watchdog_reset_count,
-			       gateway_usb_stream_kick_count,
-			       gateway_usb_last_queue_len,
-			       gateway_usb_last_ping_valid,
-			       gateway_usb_last_magic[0],
-			       gateway_usb_last_magic[1],
-			       gateway_usb_last_magic[2],
-			       gateway_usb_last_magic[3]);
-			dbg_printf("[gateway] heartbeat counter=%lu tick=%lu heap=%lu cpu_busy=%lu cpu_idle=%lu cpu_ticks=%lu wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_started=%d usb_cfg=%d host_ready=%d upstream_cfg=%d cfg_seq=%lu cfg_host=%s cfg_port=%u cfg_path=%s upstream_conn=%d upstream_rc=%d upstream_errno=%d attempts=%lu rx=%lu tx=%lu bin=%lu txt=%lu last_opcode=%lu last_len=%lu proto_init=%d enq=%lu sent=%lu drop=%lu ring=%lu kick_rc=%d in_busy=%d in_done=%lu in_err=%lu flush=%lu wd=%lu kicks=%lu qlen=%lu last_valid=%d magic=%02x%02x%02x%02x\r\n",
-				   heartbeat_counter++,
-				   (unsigned long)xTaskGetTickCount(),
-				   (unsigned long)xPortGetFreeHeapSize(),
-				   gateway_cpu_busy_pct,
-				   gateway_cpu_idle_pct,
-				   gateway_cpu_sample_ticks,
-				   gateway_wifi_connected,
-				   gateway_wifi_dhcp_ready,
-				   gateway_wifi_last_connect_rc,
-				   gateway_usb_started,
-				   gateway_usb_configured,
-				   gateway_usb_host_ready,
-				   heartbeat_cfg_valid,
-				   (unsigned long)heartbeat_config.seq_no,
-				   heartbeat_host,
-				   (unsigned)heartbeat_config.port,
-				   heartbeat_path,
-				   gateway_upstream_connected,
-				   gateway_upstream_last_rc,
-				   gateway_upstream_last_errno,
-				   gateway_upstream_connect_attempts,
-				   gateway_usb_rx_packets,
-				   gateway_usb_tx_packets,
-				   gateway_upstream_binary_frames,
-				   gateway_upstream_text_frames,
-				   gateway_upstream_last_opcode,
-				   gateway_upstream_last_payload_len,
-				   gateway_usb_proto_init_sent,
-				   gateway_usb_stream_bytes_enqueued,
-				   gateway_usb_stream_bytes_sent,
-				   gateway_usb_stream_drop_count,
-				   (unsigned long)gateway_usb_last_ring_count,
-				   gateway_usb_last_kick_rc,
-				   gateway_usb_ctx.in_busy,
-				   gateway_usb_in_complete_count,
-				   gateway_usb_in_error_count,
-				   gateway_usb_fifo_flush_count,
-				   gateway_usb_watchdog_reset_count,
-				   gateway_usb_stream_kick_count,
-				   gateway_usb_last_queue_len,
-				   gateway_usb_last_ping_valid,
-				   gateway_usb_last_magic[0],
-				   gateway_usb_last_magic[1],
-				   gateway_usb_last_magic[2],
-				   gateway_usb_last_magic[3]);
-			dbg_printf("[gateway][usbdbg] last_valid=%d actual=%lu magic=%02x %02x %02x %02x seq=%lu payload=%lu bytes=%02x %02x %02x %02x\r\n",
-				   gateway_usb_last_ping_valid,
-				   gateway_usb_last_actual,
-				   gateway_usb_last_magic[0],
-				   gateway_usb_last_magic[1],
-				   gateway_usb_last_magic[2],
-				   gateway_usb_last_magic[3],
-				   gateway_usb_last_seq,
-				   gateway_usb_last_payload_len,
-				   gateway_usb_last_bytes[0],
-				   gateway_usb_last_bytes[1],
-				   gateway_usb_last_bytes[2],
-				   gateway_usb_last_bytes[3]);
-			dbg_printf("[gateway][usbdbg2] req=0x%08lx ctx=0x%08lx req[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x ctx[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x\r\n",
-				   gateway_usb_last_req_buf_addr,
-				   gateway_usb_last_ctx_buf_addr,
-				   gateway_usb_last_req_dump[0],
-				   gateway_usb_last_req_dump[1],
-				   gateway_usb_last_req_dump[2],
-				   gateway_usb_last_req_dump[3],
-				   gateway_usb_last_req_dump[4],
-				   gateway_usb_last_req_dump[5],
-				   gateway_usb_last_req_dump[6],
-				   gateway_usb_last_req_dump[7],
-				   gateway_usb_last_ctx_dump[0],
-				   gateway_usb_last_ctx_dump[1],
-				   gateway_usb_last_ctx_dump[2],
-				   gateway_usb_last_ctx_dump[3],
-				   gateway_usb_last_ctx_dump[4],
-				   gateway_usb_last_ctx_dump[5],
-				   gateway_usb_last_ctx_dump[6],
-				   gateway_usb_last_ctx_dump[7]);
+			       gateway_usb_watchdog_reset_count);
+			++heartbeat_counter;
 		}
 
 		vTaskDelay(pdMS_TO_TICKS(10));
@@ -2040,68 +1954,36 @@ void gateway_ameba_log_status(void)
 	gateway_upstream_config_t status_config;
 	int status_cfg_valid = 0;
 	const char *status_host = "<unset>";
-	const char *status_path = "<unset>";
 
 	memset(&status_config, 0, sizeof(status_config));
 	status_cfg_valid = gateway_upstream_config_snapshot(&status_config);
 	if (status_cfg_valid) {
 		if (status_config.host[0] != '\0')
 			status_host = status_config.host;
-		if (status_config.path[0] != '\0')
-			status_path = status_config.path;
 	}
 
-	printf("[gateway][printf] status tick=%lu heap=%lu cpu_busy=%lu cpu_idle=%lu cpu_ticks=%lu task_attempted=%d task_created=%d task_running=%d task_rc=%d wifi_started=%d wifi_conn=%d wifi_ip=%d wifi_rc=%d usb_start_attempted=%d usb_start_rc=%d usb_started=%d usb_cfg=%d host_ready=%d upstream_started=%d upstream_cfg=%d cfg_seq=%lu cfg_host=%s cfg_port=%u cfg_path=%s upstream_conn=%d upstream_rc=%d upstream_errno=%d upstream_attempts=%lu txt=%lu bin=%lu close=%lu last_opcode=%lu last_len=%lu rx=%lu tx=%lu ping_valid=%d actual=%lu proto_init=%d enq=%lu sent=%lu drop=%lu ring=%lu kick_rc=%d in_busy=%d in_done=%lu in_err=%lu flush=%lu wd=%lu kicks=%lu qlen=%lu\r\n",
+	printf("[gateway] status tick=%lu heap=%lu cpu_busy=%lu cpu_idle=%lu cpu_ticks=%lu wifi_conn=%d wifi_ip=%d usb_cfg=%d host_ready=%d upstream_cfg=%d cfg_host=%s cfg_port=%u upstream_conn=%d upstream_attempts=%lu proto_init=%d enq=%lu sent=%lu drop=%lu ring=%lu in_done=%lu wd=%lu\r\n",
 	       (unsigned long)xTaskGetTickCount(),
 	       (unsigned long)xPortGetFreeHeapSize(),
 	       gateway_cpu_busy_pct,
 	       gateway_cpu_idle_pct,
 	       gateway_cpu_sample_ticks,
-	       gateway_task_create_attempted,
-	       gateway_task_created,
-	       gateway_task_running,
-	       gateway_task_create_rc,
-	       gateway_wifi_connect_started,
 	       gateway_wifi_connected,
 	       gateway_wifi_dhcp_ready,
-	       gateway_wifi_last_connect_rc,
-	       gateway_usb_start_attempted,
-	       gateway_usb_start_rc,
-	       gateway_usb_started,
 	       gateway_usb_configured,
 	       gateway_usb_host_ready,
-	       gateway_upstream_connect_started,
 	       status_cfg_valid,
-	       (unsigned long)status_config.seq_no,
 	       status_host,
 	       (unsigned)status_config.port,
-	       status_path,
 	       gateway_upstream_connected,
-	       gateway_upstream_last_rc,
-	       gateway_upstream_last_errno,
 	       gateway_upstream_connect_attempts,
-	       gateway_upstream_text_frames,
-	       gateway_upstream_binary_frames,
-	       gateway_upstream_close_frames,
-	       gateway_upstream_last_opcode,
-	       gateway_upstream_last_payload_len,
-	       gateway_usb_rx_packets,
-	       gateway_usb_tx_packets,
-	       gateway_usb_last_ping_valid,
-	       gateway_usb_last_actual,
 	       gateway_usb_proto_init_sent,
 	       gateway_usb_stream_bytes_enqueued,
 	       gateway_usb_stream_bytes_sent,
 	       gateway_usb_stream_drop_count,
 	       (unsigned long)gateway_usb_last_ring_count,
-	       gateway_usb_last_kick_rc,
-	       gateway_usb_ctx.in_busy,
 	       gateway_usb_in_complete_count,
-	       gateway_usb_in_error_count,
-	       gateway_usb_fifo_flush_count,
-	       gateway_usb_watchdog_reset_count,
-	       gateway_usb_stream_kick_count,
-	       gateway_usb_last_queue_len);
+	       gateway_usb_watchdog_reset_count);
 }
 
 static void fATGS(void *arg)

@@ -48,6 +48,48 @@ struct SharedVideoState {
 	std::deque<QueuedVideoPacket> queue;
 	bool waiting_for_keyframe = true;
 	size_t dropped_packets = 0;
+	bool frag_active = false;
+	uint32_t frag_frame_id = 0;
+	uint8_t frag_flags = 0;
+	uint16_t frag_count = 0;
+	uint32_t frag_last_seq_no = 0;
+	size_t frag_received = 0;
+	size_t frag_total_size = 0;
+	std::vector<std::vector<uint8_t>> frag_parts;
+};
+
+struct SharedAudioState {
+	std::mutex lock;
+	std::deque<std::vector<uint8_t>> queue;
+	size_t queued_bytes = 0;
+	bool started = false;
+	unsigned long dropped_packets = 0;
+};
+
+struct AudioTelemetry {
+	std::mutex lock;
+	uint64_t last_log_ms = 0;
+	uint64_t last_rx_ms = 0;
+	unsigned long rx_packets = 0;
+	unsigned long rx_bytes = 0;
+	unsigned long feed_packets = 0;
+	unsigned long dropped_packets = 0;
+	unsigned long low_water_events = 0;
+	unsigned long underflow_events = 0;
+	unsigned long max_rx_gap_ms = 0;
+	unsigned long gap_over_30ms = 0;
+	unsigned long min_sdl_queued = ~0ul;
+	unsigned long max_sdl_queued = 0;
+	unsigned long max_app_queued = 0;
+	unsigned long debug_header_packets = 0;
+	unsigned long debug_index_gaps = 0;
+	unsigned long debug_offset_jumps = 0;
+	bool have_debug_prev = false;
+	uint32_t last_debug_index = 0;
+	uint32_t last_debug_offset = 0;
+	uint32_t last_debug_pcm_bytes = 0;
+	bool low_water_active = false;
+	bool underflow_active = false;
 };
 
 struct PlaybackState {
@@ -55,7 +97,18 @@ struct PlaybackState {
 	SDL_AudioDeviceID audio_dev = 0;
 	std::atomic<bool> running{true};
 	SharedVideoState video;
-	size_t audio_drop_threshold = 3200;
+	SharedAudioState audio;
+	std::mutex audio_service_lock;
+	AudioTelemetry audio_telemetry;
+	size_t audio_prebuffer_bytes = 8u * 1024u;
+	size_t audio_target_bytes = 16u * 1024u;
+	size_t audio_max_buffer_bytes = 48u * 1024u;
+	size_t audio_queue_log_threshold = 32u * 1024u;
+	std::atomic<unsigned long> audio_packets{0};
+	std::atomic<unsigned long> audio_bytes{0};
+	std::atomic<unsigned long> audio_dropped_packets{0};
+	std::atomic<unsigned long> audio_feed_packets{0};
+	std::atomic<unsigned long> audio_underflow_events{0};
 	std::vector<uint8_t> usb_prefetch;
 	size_t usb_prefetch_off = 0;
 };
@@ -113,11 +166,7 @@ struct UsbUpstreamOptions {
 
 static bool audio_output_enabled()
 {
-#ifdef _WIN32
-	return false;
-#else
 	return true;
-#endif
 }
 
 static bool render_frame(DecoderState &state, AVFrame *frame)
@@ -235,7 +284,7 @@ static void annexb_append(std::vector<uint8_t> &packet, const std::vector<uint8_
 }
 
 static bool decode_video_packet(DecoderState &state, const std::vector<uint8_t> &packet_bytes,
-				bool keyframe)
+	bool keyframe)
 {
 	AVPacket *packet = nullptr;
 	int rc;
@@ -351,6 +400,88 @@ static void enqueue_video_packet(SharedVideoState &state, std::vector<uint8_t> &
 	state.queue.emplace_back(std::move(queued));
 }
 
+static uint32_t read_u32le(const uint8_t *in);
+static uint16_t read_u16le(const uint8_t *in);
+
+static void reset_video_fragments(SharedVideoState &state)
+{
+	state.frag_active = false;
+	state.frag_frame_id = 0;
+	state.frag_flags = 0;
+	state.frag_count = 0;
+	state.frag_last_seq_no = 0;
+	state.frag_received = 0;
+	state.frag_total_size = 0;
+	state.frag_parts.clear();
+}
+
+static bool reassemble_video_payload(SharedVideoState &state, std::vector<uint8_t> &payload,
+				     uint8_t &flags, uint32_t seq_no)
+{
+	uint16_t frag_index;
+	uint16_t frag_count;
+	uint32_t frame_id;
+	size_t frag_len;
+	std::vector<uint8_t> assembled;
+
+	if (payload.size() < 16u || memcmp(payload.data(), "VFG1", 4) != 0)
+		return true;
+
+	flags = payload[4];
+	frag_index = read_u16le(payload.data() + 6);
+	frag_count = read_u16le(payload.data() + 8);
+	frame_id = read_u32le(payload.data() + 12);
+	frag_len = payload.size() - 16u;
+
+	if (frag_count == 0u || frag_index >= frag_count) {
+		fprintf(stderr,
+			"gateway_client: invalid video fragment frame=%u index=%u count=%u len=%zu\n",
+			(unsigned)frame_id,
+			(unsigned)frag_index,
+			(unsigned)frag_count,
+			payload.size());
+		reset_video_fragments(state);
+		return false;
+	}
+
+	if (!state.frag_active ||
+	    state.frag_frame_id != frame_id ||
+	    state.frag_count != frag_count) {
+		reset_video_fragments(state);
+		state.frag_active = true;
+		state.frag_frame_id = frame_id;
+		state.frag_flags = flags;
+		state.frag_count = frag_count;
+		state.frag_parts.resize(frag_count);
+	}
+
+	if (state.frag_parts[frag_index].empty()) {
+		state.frag_parts[frag_index].assign(payload.begin() + 16, payload.end());
+		++state.frag_received;
+		state.frag_total_size += frag_len;
+	}
+	state.frag_last_seq_no = seq_no;
+
+	if (state.frag_received != state.frag_count)
+		return false;
+
+	assembled.reserve(state.frag_total_size);
+	for (uint16_t i = 0; i < state.frag_count; ++i) {
+		if (state.frag_parts[i].empty()) {
+			reset_video_fragments(state);
+			return false;
+		}
+		assembled.insert(assembled.end(),
+				 state.frag_parts[i].begin(),
+				 state.frag_parts[i].end());
+	}
+
+	flags = state.frag_flags;
+	payload.swap(assembled);
+	reset_video_fragments(state);
+	return true;
+}
+
 static void trim_video_queue_for_latency(SharedVideoState &state)
 {
 	if (state.queue.size() <= kVideoCatchupThreshold)
@@ -381,6 +512,206 @@ static void trim_video_queue_for_latency(SharedVideoState &state)
 			(unsigned)state.queue.front().seq_no,
 			state.queue.size());
 	}
+}
+
+static uint64_t steady_now_ms()
+{
+	using namespace std::chrono;
+	return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static uint32_t read_u32le(const uint8_t *in)
+{
+	return ((uint32_t)in[0]) |
+	       ((uint32_t)in[1] << 8) |
+	       ((uint32_t)in[2] << 16) |
+	       ((uint32_t)in[3] << 24);
+}
+
+static uint16_t read_u16le(const uint8_t *in)
+{
+	return (uint16_t)(((uint16_t)in[0]) | ((uint16_t)in[1] << 8));
+}
+
+static void audio_note_rx(PlaybackState &state, size_t payload_size)
+{
+	const uint64_t now = steady_now_ms();
+	std::lock_guard<std::mutex> guard(state.audio_telemetry.lock);
+
+	if (state.audio_telemetry.last_rx_ms != 0) {
+		const unsigned long gap_ms =
+			(unsigned long)(now - state.audio_telemetry.last_rx_ms);
+		if (gap_ms > state.audio_telemetry.max_rx_gap_ms)
+			state.audio_telemetry.max_rx_gap_ms = gap_ms;
+		if (gap_ms > 30)
+			++state.audio_telemetry.gap_over_30ms;
+	}
+	state.audio_telemetry.last_rx_ms = now;
+	++state.audio_telemetry.rx_packets;
+	state.audio_telemetry.rx_bytes += (unsigned long)payload_size;
+}
+
+static void audio_note_drop(PlaybackState &state)
+{
+	std::lock_guard<std::mutex> guard(state.audio_telemetry.lock);
+	++state.audio_telemetry.dropped_packets;
+}
+
+static void audio_note_feed(PlaybackState &state)
+{
+	std::lock_guard<std::mutex> guard(state.audio_telemetry.lock);
+	++state.audio_telemetry.feed_packets;
+}
+
+static void audio_note_levels(PlaybackState &state, size_t sdl_queued, size_t app_queued)
+{
+	std::lock_guard<std::mutex> guard(state.audio_telemetry.lock);
+	const bool low_water = state.audio.started &&
+		(sdl_queued + app_queued) < 640u;
+	const bool underflow = state.audio.started &&
+		sdl_queued == 0u && app_queued == 0u;
+
+	if (sdl_queued < state.audio_telemetry.min_sdl_queued)
+		state.audio_telemetry.min_sdl_queued = (unsigned long)sdl_queued;
+	if (sdl_queued > state.audio_telemetry.max_sdl_queued)
+		state.audio_telemetry.max_sdl_queued = (unsigned long)sdl_queued;
+	if (app_queued > state.audio_telemetry.max_app_queued)
+		state.audio_telemetry.max_app_queued = (unsigned long)app_queued;
+	if (low_water && !state.audio_telemetry.low_water_active)
+		++state.audio_telemetry.low_water_events;
+	if (underflow && !state.audio_telemetry.underflow_active) {
+		++state.audio_telemetry.underflow_events;
+		state.audio_underflow_events.fetch_add(1, std::memory_order_relaxed);
+	}
+	state.audio_telemetry.low_water_active = low_water;
+	state.audio_telemetry.underflow_active = underflow;
+}
+
+static void audio_log_periodic(PlaybackState &state)
+{
+	(void)state;
+}
+
+static bool unwrap_audio_debug_payload(PlaybackState &state, std::vector<uint8_t> &payload)
+{
+	uint32_t chunk_index = 0;
+	uint32_t offset = 0;
+	size_t pcm_size = 0;
+	std::lock_guard<std::mutex> guard(state.audio_telemetry.lock);
+
+	if (payload.size() < 12 || memcmp(payload.data(), "AUD0", 4) != 0)
+		return true;
+
+	chunk_index = read_u32le(payload.data() + 4);
+	offset = read_u32le(payload.data() + 8);
+	pcm_size = payload.size() - 12;
+	++state.audio_telemetry.debug_header_packets;
+
+	if (state.audio_telemetry.have_debug_prev) {
+		const uint32_t expected_index = state.audio_telemetry.last_debug_index + 1u;
+		const uint32_t expected_offset =
+			state.audio_telemetry.last_debug_offset +
+			state.audio_telemetry.last_debug_pcm_bytes;
+		if (chunk_index != expected_index)
+			++state.audio_telemetry.debug_index_gaps;
+		if (offset != expected_offset && offset != 0u)
+			++state.audio_telemetry.debug_offset_jumps;
+	}
+
+	state.audio_telemetry.have_debug_prev = true;
+	state.audio_telemetry.last_debug_index = chunk_index;
+	state.audio_telemetry.last_debug_offset = offset;
+	state.audio_telemetry.last_debug_pcm_bytes = (uint32_t)pcm_size;
+	payload.erase(payload.begin(), payload.begin() + 12);
+	(void)pcm_size;
+	return true;
+}
+
+static void enqueue_audio_packet(PlaybackState &state, std::vector<uint8_t> &payload)
+{
+	std::lock_guard<std::mutex> guard(state.audio.lock);
+
+	while (!state.audio.queue.empty() &&
+	       state.audio.queued_bytes + payload.size() > state.audio_max_buffer_bytes) {
+		state.audio.queued_bytes -= state.audio.queue.front().size();
+		state.audio.queue.pop_front();
+		++state.audio.dropped_packets;
+		state.audio_dropped_packets.fetch_add(1, std::memory_order_relaxed);
+		audio_note_drop(state);
+	}
+
+	if (payload.size() > state.audio_max_buffer_bytes) {
+		++state.audio.dropped_packets;
+		state.audio_dropped_packets.fetch_add(1, std::memory_order_relaxed);
+		audio_note_drop(state);
+		return;
+	}
+
+	state.audio.queued_bytes += payload.size();
+	state.audio.queue.emplace_back(std::move(payload));
+}
+
+static void service_audio_output(PlaybackState &state)
+{
+	std::lock_guard<std::mutex> service_guard(state.audio_service_lock);
+	Uint32 sdl_queued = 0;
+
+	if (state.audio_dev == 0 || !audio_output_enabled())
+		return;
+
+	sdl_queued = SDL_GetQueuedAudioSize(state.audio_dev);
+
+	for (;;) {
+		std::vector<uint8_t> packet;
+		size_t app_queued = 0;
+		size_t total_available = 0;
+		bool should_start = false;
+
+		{
+			std::lock_guard<std::mutex> guard(state.audio.lock);
+			app_queued = state.audio.queued_bytes;
+			total_available = (size_t)sdl_queued + app_queued;
+			if (!state.audio.started) {
+				if (total_available < state.audio_prebuffer_bytes)
+					return;
+				state.audio.started = true;
+				should_start = true;
+			}
+			if ((size_t)sdl_queued >= state.audio_target_bytes || state.audio.queue.empty())
+				break;
+			packet = std::move(state.audio.queue.front());
+			state.audio.queue.pop_front();
+			state.audio.queued_bytes -= packet.size();
+		}
+
+		if (should_start) {
+			SDL_PauseAudioDevice(state.audio_dev, 0);
+			fprintf(stderr,
+				"gateway_client: audio playback started prebuffer=%zu target=%zu\n",
+				state.audio_prebuffer_bytes,
+				state.audio_target_bytes);
+		}
+
+		if (!packet.empty()) {
+			if (SDL_QueueAudio(state.audio_dev, packet.data(), (Uint32)packet.size()) != 0) {
+				fprintf(stderr, "gateway_client: SDL_QueueAudio failed: %s\n", SDL_GetError());
+				return;
+			}
+			sdl_queued += (Uint32)packet.size();
+			state.audio_feed_packets.fetch_add(1, std::memory_order_relaxed);
+			audio_note_feed(state);
+		}
+	}
+
+	{
+		size_t app_queued = 0;
+		{
+			std::lock_guard<std::mutex> guard(state.audio.lock);
+			app_queued = state.audio.queued_bytes;
+		}
+		audio_note_levels(state, (size_t)sdl_queued, app_queued);
+	}
+
 }
 
 static bool decrypt_usb_media_payload(const gateway_proto_media_info_t &media_info,
@@ -1280,15 +1611,19 @@ static void network_reader(PlaybackState *state)
 
 		if (media_info.stream_id == GATEWAY_PROTO_STREAM_VIDEO) {
 			std::lock_guard<std::mutex> guard(state->video.lock);
+			uint8_t video_flags = media_info.flags;
 			uint8_t nal_type = h264_nal_type(payload);
-			if ((media_info.flags & GATEWAY_PROTO_FLAG_CONFIG) != 0) {
+			if (!reassemble_video_payload(state->video, payload, video_flags, media_info.seq_no))
+				continue;
+			nal_type = h264_nal_type(payload);
+			if ((video_flags & GATEWAY_PROTO_FLAG_CONFIG) != 0) {
 				if (nal_type == 7)
 					state->video.sps = payload;
 				else if (nal_type == 8)
 					state->video.pps = payload;
 			} else {
 				std::vector<uint8_t> packet;
-				bool keyframe = (media_info.flags & GATEWAY_PROTO_FLAG_KEYFRAME) != 0;
+				bool keyframe = (video_flags & GATEWAY_PROTO_FLAG_KEYFRAME) != 0;
 
 				if (keyframe) {
 					annexb_append(packet, state->video.sps);
@@ -1300,9 +1635,13 @@ static void network_reader(PlaybackState *state)
 			}
 		} else if (media_info.stream_id == GATEWAY_PROTO_STREAM_AUDIO) {
 			if (audio_output_enabled() && state->audio_dev != 0) {
-				if (SDL_GetQueuedAudioSize(state->audio_dev) > state->audio_drop_threshold)
-					SDL_ClearQueuedAudio(state->audio_dev);
-				SDL_QueueAudio(state->audio_dev, payload.data(), (Uint32)payload.size());
+				if (!unwrap_audio_debug_payload(*state, payload))
+					continue;
+				state->audio_packets.fetch_add(1, std::memory_order_relaxed);
+				state->audio_bytes.fetch_add((unsigned long)payload.size(), std::memory_order_relaxed);
+				audio_note_rx(*state, payload.size());
+				enqueue_audio_packet(*state, payload);
+				service_audio_output(*state);
 			}
 		}
 	}
@@ -1516,8 +1855,17 @@ int main(int argc, char **argv)
 		desired.channels = init_info.audio_channels;
 		desired.samples = 512;
 		state.audio_dev = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, 0);
-		if (state.audio_dev != 0)
-			SDL_PauseAudioDevice(state.audio_dev, 0);
+		if (state.audio_dev != 0) {
+			SDL_PauseAudioDevice(state.audio_dev, 1);
+			fprintf(stderr,
+				"gateway_client: audio opened freq=%d format=0x%04x channels=%u samples=%u\n",
+				obtained.freq,
+				(unsigned)obtained.format,
+				(unsigned)obtained.channels,
+				(unsigned)obtained.samples);
+		} else {
+			fprintf(stderr, "gateway_client: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+		}
 	} else {
 		fprintf(stderr, "gateway_client: audio output disabled on Windows\n");
 	}
@@ -1576,6 +1924,9 @@ int main(int argc, char **argv)
 			++decoded_this_round;
 		}
 
+		service_audio_output(state);
+		audio_log_periodic(state);
+
 		if (decoded_this_round == 0)
 			SDL_Delay(1);
 	}
@@ -1584,6 +1935,22 @@ int main(int argc, char **argv)
 	if (reader_thread.joinable())
 		reader_thread.join();
 	gateway_client_transport_close(&state.transport);
+	if (state.audio_dev != 0) {
+		size_t app_queued = 0;
+		{
+			std::lock_guard<std::mutex> guard(state.audio.lock);
+			app_queued = state.audio.queued_bytes;
+		}
+		fprintf(stderr,
+			"gateway_client: audio summary packets=%lu bytes=%lu fed=%lu dropped=%lu underflow=%lu sdl_queued=%u app_queued=%zu\n",
+			state.audio_packets.load(std::memory_order_relaxed),
+			state.audio_bytes.load(std::memory_order_relaxed),
+			state.audio_feed_packets.load(std::memory_order_relaxed),
+			state.audio_dropped_packets.load(std::memory_order_relaxed),
+			state.audio_underflow_events.load(std::memory_order_relaxed),
+			(unsigned)SDL_GetQueuedAudioSize(state.audio_dev),
+			app_queued);
+	}
 	if (state.audio_dev != 0)
 		SDL_CloseAudioDevice(state.audio_dev);
 	decoder_destroy(decoder);
