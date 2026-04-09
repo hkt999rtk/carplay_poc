@@ -31,6 +31,7 @@ extern "C" {
 #include <SDL2/SDL.h>
 
 #include "gateway_proto.h"
+#include "crypto_stream.h"
 #include "transport.h"
 }
 
@@ -62,6 +63,9 @@ struct PlaybackState {
 static constexpr size_t kMaxQueuedVideoPackets = 8;
 static constexpr size_t kVideoCatchupThreshold = 6;
 static constexpr size_t kVideoDecodeBurst = 4;
+static const uint8_t kUsbCryptoSessionNonce[CRYPTO_STREAM_NONCE_SIZE] = {
+	'U', 'S', 'B', 'R', 'e', 'l', 'a', 'y', 'V', '1', '!', '!'
+};
 
 struct DecoderState {
 	AVCodecContext *codec_ctx = nullptr;
@@ -377,6 +381,48 @@ static void trim_video_queue_for_latency(SharedVideoState &state)
 			(unsigned)state.queue.front().seq_no,
 			state.queue.size());
 	}
+}
+
+static bool decrypt_usb_media_payload(const gateway_proto_media_info_t &media_info,
+				      std::vector<uint8_t> &payload)
+{
+	std::vector<uint8_t> plaintext;
+	uint8_t decrypted_stream_id = 0;
+	uint32_t decrypted_seq_no = 0;
+	int decrypted_len;
+
+	if (payload.empty())
+		return true;
+
+	plaintext.resize(payload.size());
+	decrypted_len = crypto_stream_decrypt_packet(
+		plaintext.data(), plaintext.size(),
+		&decrypted_stream_id, &decrypted_seq_no,
+		kUsbCryptoSessionNonce,
+		payload.data(), payload.size());
+	if (decrypted_len < 0) {
+		fprintf(stderr,
+			"gateway_client: usb payload decrypt failed stream=%u seq=%u enc_len=%zu\n",
+			(unsigned)media_info.stream_id,
+			(unsigned)media_info.seq_no,
+			payload.size());
+		return false;
+	}
+
+	if (decrypted_stream_id != media_info.stream_id ||
+	    decrypted_seq_no != media_info.seq_no) {
+		fprintf(stderr,
+			"gateway_client: usb payload metadata mismatch outer(stream=%u seq=%u) inner(stream=%u seq=%u)\n",
+			(unsigned)media_info.stream_id,
+			(unsigned)media_info.seq_no,
+			(unsigned)decrypted_stream_id,
+			(unsigned)decrypted_seq_no);
+		return false;
+	}
+
+	plaintext.resize((size_t)decrypted_len);
+	payload.swap(plaintext);
+	return true;
 }
 
 static bool detect_local_ipv4(std::string &out)
@@ -1078,6 +1124,12 @@ static int run_diag_dump(const gateway_client_transport_options_t &transport_opt
 			}
 			continue;
 		}
+		if (!decrypt_usb_media_payload(media_info, payload)) {
+			fprintf(stderr,
+				"gateway_client: dropped diag packet after usb decrypt failure seq=%u\n",
+				(unsigned)media_info.seq_no);
+			continue;
+		}
 
 		fprintf(stderr,
 			"gateway_client: pkt[%d] stream=%u flags=0x%02x seq=%u len=%u first=%02x %02x %02x %02x\n",
@@ -1085,7 +1137,7 @@ static int run_diag_dump(const gateway_client_transport_options_t &transport_opt
 			(unsigned)media_info.stream_id,
 			(unsigned)media_info.flags,
 			(unsigned)media_info.seq_no,
-			(unsigned)media_info.payload_len,
+			(unsigned)payload.size(),
 			payload.size() > 0 ? payload[0] : 0,
 			payload.size() > 1 ? payload[1] : 0,
 			payload.size() > 2 ? payload[2] : 0,
@@ -1223,6 +1275,8 @@ static void network_reader(PlaybackState *state)
 			}
 			continue;
 		}
+		if (!decrypt_usb_media_payload(media_info, payload))
+			continue;
 
 		if (media_info.stream_id == GATEWAY_PROTO_STREAM_VIDEO) {
 			std::lock_guard<std::mutex> guard(state->video.lock);
